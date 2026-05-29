@@ -23,6 +23,14 @@ is constructed by the standalone ``bagpipe-bgp`` daemon and instantiates
 OpenFlow listener at ``127.0.0.1:6633``, and lacks ``send_request()``.  The
 first ``add_flow`` call therefore raises ``AttributeError``.
 
+Note: standalone ``bagpipe-bgp`` *can* still create OVS *ports* via OVSDB
+(``ovs-vsctl add-port``); it is only OpenFlow flow installation that needs
+the controller context.  In a partially-deployed cluster you may see
+per-PE ``vxlan-XXXXXX`` ports already on ``br-tun`` even though no flows
+target them - that is bagpipe-bgp having succeeded at OVSDB and failed at
+OF.  Our handler is idempotent against pre-existing ports
+(``OVSTunnelBridge.add_tunnel_port`` returns the existing ofport).
+
 OpenFlow connection direction is switch-initiated (``ovs-vswitchd``
 connects out to the controller's ``:6633`` listener).  Only the listener
 owner has an established session it can ``send_msg`` over.  The agent's
@@ -44,8 +52,12 @@ Mechanism
 * The agent extension instantiates :class:`EvpnXcHandler` at the end of
   :meth:`BagpipeBgpvpnAgentExtension.initialize`.
 * The handler runs an :class:`oslo_service.loopingcall.FixedIntervalLoopingCall`
-  that polls bagpipe-bgp's looking-glass REST at ``http://<API>:<port>/`` for
-  current VPN instances and their EVPN routes.
+  that polls bagpipe-bgp's looking-glass REST at
+  ``http://<host>:<port>/looking-glass/vpns/instances/<EVI>/best_routes``
+  for current EVPN routes.  bagpipe-bgp 22.0.0 emits routes as a JSON
+  object whose **outer keys are tuples of (route-type, identifier)**
+  (e.g. ``"('MAC', FA:16:3E:35:F1:0B)"``) and whose values are lists of
+  dicts whose **single inner key is an NLRI string**.  We parse both.
 * Type-2 routes (MAC/IP) become ``UCAST_TO_TUN`` flows plus ARP responder
   entries on ``br-tun``.  Type-3 (IMET) routes become flooding bucket
   entries on the EVI's group.  Per-MAC unicast targets a per-PE VXLAN
@@ -69,6 +81,28 @@ restart resync of remote MAC mobility.  Functional Linux tests are out of
 scope for the first commit; see ``test_evpn_xc_handler.py`` for the unit
 tests landed alongside the agent_extension hook.
 
+Schema reference (bagpipe-bgp 22.0.0)
+-------------------------------------
+Type-2 (MAC/IP) inner-key format::
+
+    evpn:macadv::<rd_pe>:<eth_tag>:<esi>:<eth_tag2>:<MAC>/<masklen>:<IP>: label <label> (<vni>)
+
+Example::
+
+    evpn:macadv::172.16.85.53:0:-:0:FA:16:3E:B5:FE:D2/48:10.99.0.11: label 624 (9999)
+
+Type-3 (Inclusive Multicast) inner-key format::
+
+    evpn:multicast::<rd_pe>:<eth_tag>:<eth_tag2>:<originator_ip>
+
+Example::
+
+    evpn:multicast::172.16.85.53:0:0:172.16.85.53
+
+For Type-3 the VNI lives in ``attributes.pmsi-tunnel``::
+
+    pmsi:ingressreplication:0:<label>(<vni>):<originator_ip>
+
 References
 ----------
 * :mod:`networking_bagpipe.bagpipe_bgp.vpn.evpn.ovs` - the upstream EVPN
@@ -79,6 +113,7 @@ References
 """
 
 import collections
+import re
 import threading
 
 import requests
@@ -116,6 +151,42 @@ FLOW_PRIORITY = 5
 # the local VTEP we record it as "local" and exclude it from BUM head-end
 # replication (the local agent already delivers via patch-tun).
 _LOCAL_PORT_SENTINEL = "local"
+
+
+# --- bagpipe-bgp 22.0.0 inner-key NLRI parsers ---------------------------
+#
+# bagpipe-bgp does not give us structured fields for the route NLRI; instead
+# the JSON object has an "inner key" string whose contents encode the NLRI.
+# Parse that string back into useful fields.  Regex chosen for readability,
+# not performance - we run this at most once per route per poll cycle.
+
+# Type-2 macadv: evpn:macadv::<rd_pe>:<a>:<b>:<c>:<MAC>/<masklen>:<IP>: label <label> (<vni>)
+# Example     : evpn:macadv::172.16.85.53:0:-:0:FA:16:3E:B5:FE:D2/48:10.99.0.11: label 624 (9999)
+_RE_T2 = re.compile(
+    r'^evpn:macadv::'
+    r'(?P<rd_pe>[^:]+):'           # RD originator IP
+    r'[^:]*:'                      # eth_tag
+    r'[^:]*:'                      # esi
+    r'[^:]*:'                      # eth_tag2
+    r'(?P<mac>[0-9A-Fa-f:]{17})/[0-9]+'   # MAC/48
+    r'(?::(?P<ip>[0-9.]+|[0-9A-Fa-f:]+))?'  # optional :IP
+    r':\s*label\s+\d+\s+\((?P<vni>\d+)\)'  # : label N (VNI)
+    r'\s*$',
+)
+
+# Type-3 multicast: evpn:multicast::<rd_pe>:<a>:<b>:<originator_ip>
+_RE_T3 = re.compile(
+    r'^evpn:multicast::'
+    r'(?P<rd_pe>[^:]+):'
+    r'[^:]*:'                      # eth_tag
+    r'[^:]*:'                      # eth_tag2
+    r'(?P<originator>[0-9.]+|[0-9A-Fa-f:]+)\s*$'
+)
+
+# pmsi-tunnel: pmsi:ingressreplication:<x>:<label>(<vni>):<originator_ip>
+_RE_PMSI = re.compile(
+    r'\((?P<vni>\d+)\)'
+)
 
 
 # Config group dedicated to this handler so it does not pollute upstream
@@ -323,30 +394,96 @@ class _BagpipeLookingGlass:
     def evi_routes(self, evi_id):
         """Return per-EVI routes (Type-2 unicast and Type-3 BUM).
 
-        bagpipe-bgp's looking-glass exposes routes under
-        ``vpns/instances/<id>/routes``.  Schema is roughly:
+        bagpipe-bgp 22.0.0 exposes routes under three sibling endpoints:
 
-        ```
-        {
-            "received": [{"prefix": "fa:16:3e:..", "remote_pe": "172.16.85.54",
-                           "vni": 9999, "type": 2, "ip": "10.99.0.22"}, ...],
-            "local":    [{"prefix": "fa:16:3e:..", "remote_pe": "172.16.85.53",
-                           "vni": 9999, "type": 2, "ip": "10.99.0.11"}, ...]
-        }
-        ```
+        * ``vpns/instances/<id>/best_routes`` - what this PE will act on.
+          Object keyed by ``"('MAC', <mac>)"`` or ``"('Multicast', ...)"``;
+          each value is a *list* of dicts whose single inner key is an
+          NLRI string (parsed via :data:`_RE_T2` / :data:`_RE_T3`) and
+          whose value is the route attributes (``next_hop``,
+          ``route_targets``, ``attributes.extended-community``,
+          ``attributes.pmsi-tunnel``).
+        * ``received_routes`` - same shape as best_routes but includes
+          duplicates / non-best-path entries.  We use ``best_routes`` for
+          the dataplane install set.
+        * ``adv_routes`` - what we are originating outward; not used for
+          flow install.
 
-        We normalise to a single iterable of dicts and let the caller
-        decide what's local vs remote.  Defensive about schema drift -
-        bagpipe's looking-glass output has changed between releases.
+        We yield a normalised iterable of dicts:
+
+            {
+                "type": 2|3,
+                "mac": "fa:16:3e:..",   # only for type 2
+                "ip":  "10.99.0.22",    # only for type 2 and only when present
+                "vni": 9999,
+                "remote_pe": "172.16.85.54",
+            }
+
+        Defensive about schema drift: any entry that fails to parse is
+        logged at DEBUG and skipped.  The handler's reconcile cycle
+        therefore degrades gracefully if bagpipe-bgp emits something we
+        don't recognise.
+
+        Phase-1 limitation: this parser is tuned for bagpipe-bgp 22.0.0
+        (the 2024.2 / Dalmatian release line that ships in WRO 26.03).
+        Other versions may drift; see the 'Schema reference' block in the
+        module docstring.
         """
-        data = self._get("vpns/instances/%s/routes" % evi_id)
+        data = self._get("vpns/instances/%s/best_routes" % evi_id)
         if data is None:
             return []
-        if isinstance(data, dict):
-            return list(data.get("received", [])) + list(data.get("local", []))
-        if isinstance(data, list):
-            return data
-        return []
+        out = []
+        # ``data`` is a dict { "(<route-type>, <ident>)": [ {<inner_key>: route}, ... ] }
+        for outer_key, route_list in (data.items() if isinstance(data, dict) else []):
+            if not isinstance(route_list, list):
+                continue
+            for entry in route_list:
+                if not isinstance(entry, dict) or not entry:
+                    continue
+                # Each entry is { <NLRI string>: { route attrs ... } }
+                for inner_key, attrs in entry.items():
+                    parsed = self._parse_route(inner_key, attrs)
+                    if parsed:
+                        out.append(parsed)
+                    else:
+                        LOG.debug("xc: unparseable route %r", inner_key)
+        return out
+
+    @staticmethod
+    def _parse_route(inner_key, attrs):
+        """Decode one inner-key NLRI string + its attribute dict."""
+        if not isinstance(inner_key, str):
+            return None
+        next_hop = (attrs or {}).get("next_hop") if isinstance(attrs, dict) else None
+
+        m = _RE_T2.match(inner_key)
+        if m:
+            return {
+                "type": 2,
+                "mac": m.group("mac").lower(),
+                "ip": m.group("ip") if m.group("ip") else None,
+                "vni": int(m.group("vni")),
+                "remote_pe": next_hop or m.group("rd_pe"),
+            }
+
+        m = _RE_T3.match(inner_key)
+        if m:
+            # VNI is in attributes.pmsi-tunnel for Type-3.
+            vni = None
+            if isinstance(attrs, dict):
+                pmsi = (attrs.get("attributes") or {}).get("pmsi-tunnel", "")
+                pmsi_match = _RE_PMSI.search(pmsi)
+                if pmsi_match:
+                    vni = int(pmsi_match.group("vni"))
+            return {
+                "type": 3,
+                "mac": None,
+                "ip": None,
+                "vni": vni,
+                "remote_pe": next_hop or m.group("originator"),
+            }
+
+        return None
 
 
 class EvpnXcHandler:
@@ -494,21 +631,23 @@ class EvpnXcHandler:
                 continue
             entry = {"vni": None, "unicast": {}, "flooding": set()}
             for r in self._lg.evi_routes(evi_id):
-                rtype = r.get("type") or r.get("route_type")
-                remote_pe = r.get("remote_pe") or r.get("nexthop")
-                vni = r.get("vni") or r.get("encap_vni")
+                # _parse_route already gave us {type, mac, ip, vni, remote_pe}
+                rtype = r.get("type")
+                remote_pe = r.get("remote_pe")
+                vni = r.get("vni")
                 if vni is not None:
+                    # Last writer wins; all routes for one EVI share VNI.
                     entry["vni"] = int(vni)
-                if rtype in (2, "evpn-2", "macadv"):
-                    mac = (r.get("prefix") or r.get("mac") or "").lower()
-                    ip = r.get("ip") or r.get("ip_address")
+                if rtype == 2:
+                    mac = r.get("mac")
+                    ip = r.get("ip")
                     if not mac or not remote_pe:
                         continue
                     if remote_pe == self._local_ip:
                         # Skip self-MACs - the OVS agent has them locally.
                         continue
                     entry["unicast"][mac] = (ip, remote_pe)
-                elif rtype in (3, "evpn-3", "imet", "multicast"):
+                elif rtype == 3:
                     if not remote_pe or remote_pe == self._local_ip:
                         continue
                     entry["flooding"].add(remote_pe)
