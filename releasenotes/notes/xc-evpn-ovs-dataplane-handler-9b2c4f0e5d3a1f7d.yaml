@@ -1,0 +1,23 @@
+---
+features:
+  - |
+    Added ``EvpnXcHandler`` to the bagpipe_bgpvpn agent extension to install
+    EVPN unicast and head-end-replication flows on ``br-tun`` from inside
+    ``neutron-openvswitch-agent``.  Standalone ``bagpipe-bgp`` cannot install
+    these flows because it is not an OpenFlow controller (it has no os-ken
+    ``RyuApp`` and no listener at ``127.0.0.1:6633``); the upstream
+    ``OVSDataplaneDriver`` raises ``AttributeError`` on the first
+    ``send_request``.  The handler reuses the agent's existing
+    ``OVSTunnelBridge`` instance, polls bagpipe-bgp's looking-glass REST API,
+    and installs flows tagged with cookie ``0xbac10e07`` for clean rollback.
+upgrade:
+  - |
+    Operators using the OVS bagpipe_bgpvpn extension MUST set
+    ``[DATAPLANE_DRIVER_EVPN] dataplane_driver = dummy`` in
+    ``/etc/bagpipe-bgp/bgp.conf`` so the daemon does not also try to
+    program OVS.  The new ``[BAGPIPE_XC]`` config group exposes
+    ``xc_local_ip`` (mandatory; equal to ``[BGP] local_address``),
+    ``xc_bagpipe_api_host`` / ``xc_bagpipe_api_port`` (defaults
+    ``127.0.0.1:8082``), ``xc_poll_interval`` (default 5 s), and
+    ``xc_request_timeout`` (default 2 s).  The handler is disabled when
+    ``xc_local_ip`` is unset.
