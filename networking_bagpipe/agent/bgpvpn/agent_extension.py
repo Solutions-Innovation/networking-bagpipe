@@ -31,6 +31,7 @@ from oslo_log import log as logging
 from networking_bagpipe._i18n import _
 from networking_bagpipe.agent import agent_base_info
 from networking_bagpipe.agent import bagpipe_bgp_agent
+from networking_bagpipe.agent.bgpvpn import _evpn_xc_handler
 from networking_bagpipe.agent.bgpvpn import constants as bgpvpn_const
 from networking_bagpipe.bagpipe_bgp import constants as bbgp_const
 from networking_bagpipe.objects import bgpvpn as objects
@@ -124,6 +125,10 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
     def __init__(self):
         super().__init__()
         self.ports = set()
+        # EvpnXcHandler instance, populated lazily in initialize().
+        # Only created for the OVS extension type and only when the
+        # operator has set [BAGPIPE_XC] xc_local_ip in neutron config.
+        self.xc_handler = None
 
     @log_helpers.log_method_call
     def consume_api(self, agent_api):
@@ -173,6 +178,30 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
                                                   self.ports)
         # OVO-based BGPVPN RPCs
         self._setup_rpc(connection)
+
+        # Solutions-Innovation cross-cluster EVPN dataplane handler.
+        # Owns the per-MAC OF flows on br-tun for cross-cluster (BGP EVPN)
+        # routes that the standalone bagpipe-bgp daemon cannot install
+        # itself (it is not an os-ken app and has no OF session).
+        # See _evpn_xc_handler.py for the full architectural rationale.
+        # Disabled if BAGPIPE_XC.xc_local_ip is unset.
+        if self._is_ovs_extension():
+            try:
+                self.xc_handler = _evpn_xc_handler.EvpnXcHandler(
+                    tun_br=self.tun_br,
+                    vlan_manager=self.vlan_manager,
+                    networks_info_getter=lambda: self.networks_info,
+                )
+                self.xc_handler.start()
+            except ValueError as exc:
+                LOG.info("xc: cross-cluster EVPN dataplane handler "
+                         "disabled: %s", exc)
+                self.xc_handler = None
+            except Exception:
+                LOG.exception("xc: cross-cluster EVPN dataplane handler "
+                              "failed to start; agent will continue without "
+                              "cross-cluster dataplane")
+                self.xc_handler = None
 
     def _is_ovs_extension(self):
         return self.driver_type == ovs_agt_consts.EXTENSION_DRIVER_TYPE
@@ -599,6 +628,15 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
                 self._gateway_traffic_redirect(net_info)
         # TODO(tmorin): need to handle restart on bagpipe-bgp side, in the
         # meantime after an OVS restart, restarting bagpipe-bgp is required
+
+        # Notify the cross-cluster EVPN handler so it drops cached state
+        # and lets its next reconcile cycle reinstall flows on the fresh
+        # bridge.
+        if self.xc_handler is not None:
+            try:
+                self.xc_handler.ovs_restarted()
+            except Exception:
+                LOG.exception("xc: ovs_restarted notification failed")
 
     @log_helpers.log_method_call
     def _enable_gw_arp_responder(self, vlan, gateway_ip):
