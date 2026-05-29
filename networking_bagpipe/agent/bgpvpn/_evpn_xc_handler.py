@@ -713,17 +713,24 @@ class EvpnXcHandler:
 
         # ---- Type-3 BUM diff ----
         new_flooding = want["flooding"]
-        for remote_pe in new_flooding - set(evi.flooding):
+        # Snapshot the installed set BEFORE mutating evi.flooding.  The
+        # render decision below must compare against this pre-mutation
+        # snapshot, not against new_flooding: after the add/remove loops
+        # run, evi.flooding always equals new_flooding, so comparing the
+        # two would never detect the initial empty -> non-empty transition
+        # and the BUM flooding group/flow would never be built.
+        old_flooding = set(evi.flooding)
+        for remote_pe in new_flooding - old_flooding:
             ofport = self.tunnel_mgr.acquire(remote_pe)
             if ofport is None:
                 continue
             evi.flooding[remote_pe] = ofport
-        for remote_pe in set(evi.flooding) - new_flooding:
+        for remote_pe in old_flooding - new_flooding:
             evi.flooding.pop(remote_pe, None)
             self.tunnel_mgr.release(remote_pe)
-        # Re-render the flooding bucket every cycle if the set changed.
-        # Cheap (single mod_group).
-        if set(evi.flooding) != new_flooding or not evi.flooding:
+        # Re-render whenever the installed set of remote PEs changed
+        # (covers empty -> non-empty, additions, and removals/tear-down).
+        if set(evi.flooding) != old_flooding:
             self._render_flooding(evi)
 
     # --- OpenFlow primitives ----------------------------------------------
