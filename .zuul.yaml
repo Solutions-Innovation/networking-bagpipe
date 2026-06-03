@@ -17,13 +17,15 @@
               - openstack/horizon
               - openstack/networking-bgpvpn
               - openstack/networking-sfc
-        - openstack-tox-py310:
+        - openstack-tox-py311:
             required-projects: &bagpipe_required_projects
               - openstack/neutron
               - openstack/horizon
               - openstack/networking-bgpvpn
               - openstack/networking-sfc
-        - openstack-tox-py312: # from openstack-python3-jobs template
+        - openstack-tox-py313: # from openstack-python3-jobs template
+            required-projects: *bagpipe_required_projects
+        - openstack-tox-py314: # from openstack-python3-jobs template
             required-projects: *bagpipe_required_projects
         - openstack-tox-cover:
             required-projects: *bagpipe_required_projects
@@ -44,9 +46,9 @@
               - openstack/horizon
               - openstack/networking-bgpvpn
               - openstack/networking-sfc
-        - openstack-tox-py310:
+        - openstack-tox-py311:
             required-projects: *bagpipe_required_projects
-        - openstack-tox-py312:
+        - openstack-tox-py313:
             required-projects: *bagpipe_required_projects
         - neutron-tempest-plugin-bgpvpn-bagpipe:
             irrelevant-files:
@@ -57,21 +59,19 @@
       jobs:
         - openstack-tox-docs:
             required-projects: *bagpipe_required_projects
-        - openstack-tox-py310:
+        - openstack-tox-py311:
             required-projects: *bagpipe_required_projects
     periodic-weekly:
       jobs:
         - openstack-tox-py312: # from openstack-python3-jobs template
             required-projects: *bagpipe_required_projects
-        - openstack-tox-py311:
-            required-projects: *bagpipe_required_projects
-        - openstack-tox-py312-with-oslo-master:
+        - openstack-tox-py313-with-oslo-master:
             required-projects: *bagpipe_required_projects
         - neutron-tempest-plugin-bgpvpn-bagpipe
         - networking-bagpipe-tempest
     experimental:
       jobs:
-        - openstack-tox-py312-with-oslo-master:
+        - openstack-tox-py313-with-oslo-master:
             required-projects: *bagpipe_required_projects
 
 - job:
