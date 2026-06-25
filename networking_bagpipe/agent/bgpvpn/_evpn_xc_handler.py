@@ -113,6 +113,7 @@ References
 """
 
 import collections
+import ipaddress
 import re
 import threading
 
@@ -143,9 +144,19 @@ LOG = logging.getLogger(__name__)
 #   on the same br-tun.
 COOKIE = 0xbac10e07
 
+# Phase-2 cookie for Type-5 inter-subnet routing flows.
+# Independent lifecycle from Phase-1 cookie for clean per-phase rollback:
+#   ovs-ofctl del-flows br-tun cookie=0xbac10e57/-1  (Type-5 only)
+#   ovs-ofctl del-flows br-tun cookie=0xbac10e07/-1  (Type-2/3 only)
+COOKIE_T5 = 0xbac10e57
+
 # Priority of UCAST_TO_TUN, ARP responder, FLOOD_TO_TUN entries we install.
 # Same priority upstream OVSEVIDataplane uses, so behaviour is comparable.
 FLOW_PRIORITY = 5
+
+# Phase-2: new OVS table for VRF-scoped L3 re-bridge after L3VNI decap.
+# Table 50 is unused by neutron's standard pipeline (tables 0-22 + 60-63).
+XC_L3_ROUTE_TABLE = 50
 
 # Sentinel for "the local PE itself".  When a Type-3 IMET route advertises
 # the local VTEP we record it as "local" and exclude it from BUM head-end
@@ -188,6 +199,24 @@ _RE_PMSI = re.compile(
     r'\((?P<vni>\d+)\)'
 )
 
+# --- Phase-2: Type-5 IP Prefix route (inter-subnet routing) ---------------
+#
+# Type-5 inner-key format (bagpipe-bgp 22.0.0):
+#   evpn:prefix::<rd_pe>:<eth_tag>:<prefix>/<masklen>: label <label> (<l3vni>)
+# Example:
+#   evpn:prefix::172.16.85.54:0:10.98.0.0/24: label 1000 (1000)
+_RE_T5 = re.compile(
+    r'^evpn:prefix::'
+    r'(?P<rd_pe>[^:]+):'
+    r'[^:]*:'                                        # eth_tag
+    r'(?P<prefix>[0-9./]+|[0-9A-Fa-f:./]+)'         # IP prefix/masklen
+    r':\s*label\s+\d+\s+\((?P<l3vni>\d+)\)'
+    r'\s*$',
+)
+
+# Router MAC extended community (carried in Type-5 route attributes)
+_RE_RMAC = re.compile(r'rmac:(?P<mac>[0-9A-Fa-f:]{17})')
+
 
 # Config group dedicated to this handler so it does not pollute upstream
 # [BAGPIPE].  Operators set these in the same neutron config file the OVS
@@ -223,6 +252,20 @@ xc_opts = [
                default=2,
                min=1,
                help=_("HTTP timeout (seconds) for bagpipe-bgp REST calls.")),
+    # Phase-2 optional overrides (normally auto-resolved from looking-glass)
+    cfg.StrOpt('xc_local_router_mac',
+               default=None,
+               help=_("Override for the local router MAC (rmac) used in "
+                      "Phase-2 Type-5 inter-subnet routing.  Normally "
+                      "resolved from the bagpipe-bgp looking-glass "
+                      "(local IPVPN route's rmac: extended community).  "
+                      "Set this only if looking-glass resolution fails.")),
+    cfg.IntOpt('xc_l3vni',
+               default=None,
+               help=_("Override for the L3VNI used in Phase-2 Type-5 "
+                      "routing.  Normally auto-derived from the Type-5 "
+                      "route's NLRI label field.  Set only if label "
+                      "parsing produces incorrect values.")),
 ]
 
 # Group name in cfg - kept under [BAGPIPE_XC] to leave [BAGPIPE] alone.
@@ -272,6 +315,52 @@ class EviState:
                 "n_unicast=%d, n_flooding=%d)" %
                 (self.vpn_instance_id, self.vlan, self.vni,
                  len(self.unicast), len(self.flooding)))
+
+
+class IpvpnEviState:
+    """Per-L3VPN instance state for cross-cluster IP prefix (Type-5) routing.
+
+    Tracks the dataplane state for one IPVPN instance (one router association).
+    Each instance maps to a unique L3VNI and VRF on the wire.
+
+    Holds:
+
+    * ``vpn_instance_id`` - e.g. ``"ipvpn_<router-uuid>"``.
+    * ``l3vni`` - the L3 VNI carried on the wire for this VRF (from Type-5
+      NLRI label field).
+    * ``local_router_mac`` - the local rmac (from bagpipe-bgp looking-glass
+      or config override), used as dl_dst match in egress flows.
+    * ``prefixes`` - dict ``prefix_str -> (remote_pe, remote_router_mac,
+      ofport)``.  Tracks installed Type-5-derived egress flows.
+    * ``l2_vlans`` - set of local OVS VLANs that belong to this L3VPN's
+      subnets (used for installing per-VLAN egress flows).
+    * ``local_subnets`` - set of locally-attached subnet CIDRs.  Used by
+      ``_is_local_prefix()`` guardrail.
+    * ``vrf_id`` - locally-significant integer loaded into reg0 for table 50
+      VRF isolation.
+    """
+
+    __slots__ = ("vpn_instance_id", "l3vni", "local_router_mac",
+                 "prefixes", "l2_vlans", "local_subnets", "vrf_id")
+
+    def __init__(self, vpn_instance_id):
+        self.vpn_instance_id = vpn_instance_id
+        self.l3vni = None
+        self.local_router_mac = None
+        # {prefix_str: (remote_pe, remote_router_mac, ofport)}
+        self.prefixes = {}
+        # set of local OVS VLANs that belong to this L3VPN
+        self.l2_vlans = set()
+        # set of locally-attached subnet CIDRs (e.g. {"10.99.0.0/24"})
+        self.local_subnets = set()
+        # Locally-significant VRF ID (loaded into reg0 for table 50 isolation)
+        self.vrf_id = None
+
+    def __repr__(self):
+        return ("IpvpnEviState(id=%s, l3vni=%s, vrf_id=%s, n_prefixes=%d, "
+                "local_subnets=%s)" %
+                (self.vpn_instance_id, self.l3vni, self.vrf_id,
+                 len(self.prefixes), self.local_subnets))
 
 
 class PerPeVxlanPortMgr:
@@ -384,12 +473,17 @@ class _BagpipeLookingGlass:
             return None
 
     def list_evis(self):
-        """Return a list of dicts with ``id`` and ``href`` for each EVI."""
+        """Return a list of dicts with ``id`` and ``href`` for each EVI.
+
+        Includes both ``evpn_`` (L2 EVI) and ``ipvpn_`` (L3 VPN) instances
+        so Phase-2 can discover IPVPN instances for Type-5 route processing.
+        """
         data = self._get("vpns/instances")
         if data is None:
             return []
         # Upstream emits a list of {id, name, description, href}.
-        return [d for d in data if str(d.get("id", "")).startswith("evpn_")]
+        return [d for d in data
+                if str(d.get("id", "")).startswith(("evpn_", "ipvpn_"))]
 
     def evi_routes(self, evi_id):
         """Return per-EVI routes (Type-2 unicast and Type-3 BUM).
@@ -449,6 +543,30 @@ class _BagpipeLookingGlass:
                         LOG.debug("xc: unparseable route %r", inner_key)
         return out
 
+    def evi_routes_raw(self, evi_id):
+        """Return the raw JSON dict for an EVI's best_routes.
+
+        Unlike :meth:`evi_routes` which parses into structured dicts, this
+        returns a flat ``{inner_key: attrs}`` mapping suitable for
+        inspecting route attributes (e.g. ``rmac:`` extended community)
+        directly.  Used by Phase-2 to resolve local router MAC from
+        looking-glass.
+        """
+        data = self._get("vpns/instances/%s/best_routes" % evi_id)
+        if data is None:
+            return {}
+        flat = {}
+        for outer_key, route_list in (data.items()
+                                      if isinstance(data, dict) else []):
+            if not isinstance(route_list, list):
+                continue
+            for entry in route_list:
+                if not isinstance(entry, dict) or not entry:
+                    continue
+                for inner_key, attrs in entry.items():
+                    flat[inner_key] = attrs
+        return flat
+
     @staticmethod
     def _parse_route(inner_key, attrs):
         """Decode one inner-key NLRI string + its attribute dict."""
@@ -481,6 +599,27 @@ class _BagpipeLookingGlass:
                 "ip": None,
                 "vni": vni,
                 "remote_pe": next_hop or m.group("originator"),
+            }
+
+        # Phase-2: Type-5 IP Prefix route (inter-subnet routing)
+        m = _RE_T5.match(inner_key)
+        if m:
+            rmac = None
+            if isinstance(attrs, dict):
+                ext_comm = (attrs.get("attributes") or {}).get(
+                    "extended-community", "")
+                rm = _RE_RMAC.search(ext_comm)
+                if rm:
+                    rmac = rm.group("mac").lower()
+            return {
+                "type": 5,
+                "prefix": m.group("prefix"),
+                "l3vni": int(m.group("l3vni")),
+                "remote_pe": next_hop or m.group("rd_pe"),
+                "remote_router_mac": rmac,
+                "mac": None,
+                "ip": None,
+                "vni": int(m.group("l3vni")),
             }
 
         return None
@@ -540,13 +679,18 @@ class EvpnXcHandler:
         self.tunnel_mgr = PerPeVxlanPortMgr(self._bridge, self._local_ip)
         self.evis = {}  # vpn_instance_id -> EviState
 
+        # Phase-2: Type-5 IPVPN state
+        self.ipvpn_evis = {}   # vpn_instance_id -> IpvpnEviState
+        self._next_vrf_id = 1
+        self._vrf_id_map = {}  # vpn_instance_id -> locally-significant vrf_id
+
         self._loop = None
         LOG.info("xc: EvpnXcHandler initialized "
-                 "(local_pe=%s, lg=%s:%d, poll=%ds, cookie=0x%x)",
+                 "(local_pe=%s, lg=%s:%d, poll=%ds, cookie=0x%x/0x%x)",
                  self._local_ip,
                  cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_host,
                  cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_port,
-                 cfg.CONF.BAGPIPE_XC.xc_poll_interval, COOKIE)
+                 cfg.CONF.BAGPIPE_XC.xc_poll_interval, COOKIE, COOKIE_T5)
 
     @log_helpers.log_method_call
     def start(self):
@@ -597,8 +741,26 @@ class EvpnXcHandler:
         for evi_id in gone:
             evi = self.evis.pop(evi_id)
             self._tear_down_evi(evi)
+
+        # --- Phase-2: Type-5 IPVPN reconcile ---
+        wanted_ipvpn = self._build_wanted_ipvpn_from_rib()
+        for evi_id, want in wanted_ipvpn.items():
+            state = self.ipvpn_evis.get(evi_id)
+            if state is None:
+                state = IpvpnEviState(evi_id)
+                self.ipvpn_evis[evi_id] = state
+            self._reconcile_ipvpn_evi(state, want)
+
+        gone_ipvpn = set(self.ipvpn_evis) - set(wanted_ipvpn)
+        for evi_id in gone_ipvpn:
+            state = self.ipvpn_evis.pop(evi_id)
+            self._tear_down_ipvpn_evi(state)
+
         LOG.debug("xc: reconcile cycle done "
-                  "(active_evis=%d, gone=%d)", len(self.evis), len(gone))
+                  "(active_evis=%d, gone=%d, "
+                  "active_ipvpn=%d, gone_ipvpn=%d)",
+                  len(self.evis), len(gone),
+                  len(self.ipvpn_evis), len(gone_ipvpn))
 
     # --- RIB ingestion ----------------------------------------------------
 
@@ -857,5 +1019,333 @@ class EvpnXcHandler:
         LOG.warning("xc: OVS restart detected; clearing state and "
                     "letting next reconcile cycle reinstall flows")
         self.evis.clear()
+        # Phase-2: clear IPVPN state and VRF allocator
+        self.ipvpn_evis.clear()
+        self._vrf_id_map.clear()
+        self._next_vrf_id = 1
         # Replace the tunnel_mgr to reset its internal refcounts/ofports.
         self.tunnel_mgr = PerPeVxlanPortMgr(self._bridge, self._local_ip)
+
+    # ======================================================================
+    # Phase-2: Type-5 inter-subnet routing (Symmetric IRB in OVS)
+    # ======================================================================
+
+    def _get_vrf_id(self, vpn_instance_id):
+        """Allocate a locally-significant VRF ID for table 50 reg0 isolation.
+
+        IDs are monotonically increasing per agent lifetime (reset on OVS
+        restart).  Supports up to 65535 VRFs (reg0[0..15]).
+        """
+        if vpn_instance_id not in self._vrf_id_map:
+            self._vrf_id_map[vpn_instance_id] = self._next_vrf_id
+            self._next_vrf_id += 1
+        return self._vrf_id_map[vpn_instance_id]
+
+    # --- Phase-2 OpenFlow primitives --------------------------------------
+
+    def _install_prefix_route(self, state, prefix, remote_pe,
+                              remote_router_mac, ofport):
+        """Egress: routed IP prefix -> dec_ttl + MAC swap + L3VNI encap.
+
+        Match includes dl_dst=<local_router_mac> to ensure only packets
+        explicitly addressed to the local router (routed traffic) enter the
+        L3 path.  Intra-subnet L2 traffic (dst_mac = remote VM MAC) will
+        never match this flow.
+
+        Installs one flow per l2_vlan in the VRF so packets from any
+        locally-attached subnet can be routed to the remote prefix.
+        """
+        if self._is_local_prefix(prefix, state):
+            LOG.debug("xc-t5: skipping locally-attached prefix %s for evi=%s",
+                      prefix, state.vpn_instance_id)
+            return False
+
+        actions = (
+            "dec_ttl,"
+            "set_field:{lrmac}->eth_src,"
+            "set_field:{rrmac}->eth_dst,"
+            "strip_vlan,"
+            "set_tunnel:{l3vni},"
+            "output:{ofport}"
+        ).format(
+            lrmac=state.local_router_mac,
+            rrmac=remote_router_mac,
+            l3vni=state.l3vni,
+            ofport=ofport,
+        )
+        for l2_vlan in state.l2_vlans:
+            self._bridge.add_flow(
+                table=ovs_const.UCAST_TO_TUN,
+                priority=FLOW_PRIORITY + 1,
+                cookie=COOKIE_T5,
+                dl_vlan=l2_vlan,
+                dl_dst=state.local_router_mac,
+                dl_type=0x0800,
+                nw_dst=prefix,
+                actions=actions,
+            )
+        LOG.debug("xc-t5: installed prefix route %s -> remote_pe=%s "
+                  "rmac=%s l3vni=%d ofport=%d (vlans=%s)",
+                  prefix, remote_pe, remote_router_mac,
+                  state.l3vni, ofport, state.l2_vlans)
+        return True
+
+    def _is_local_prefix(self, prefix, state):
+        """Return True if prefix overlaps any locally-attached subnet.
+
+        Prevents installing Type-5 egress flows for locally attached
+        prefixes that are already reachable via the L2 Type-2 path.
+        """
+        target = ipaddress.ip_network(prefix, strict=False)
+        for local_cidr in state.local_subnets:
+            local_net = ipaddress.ip_network(local_cidr, strict=False)
+            if target.overlaps(local_net):
+                return True
+        return False
+
+    def _remove_prefix_route(self, state, prefix):
+        """Remove egress prefix route flows for all local L2 VLANs."""
+        for l2_vlan in state.l2_vlans:
+            self._bridge.delete_flows(
+                strict=True,
+                table=ovs_const.UCAST_TO_TUN,
+                priority=FLOW_PRIORITY + 1,
+                cookie=COOKIE_T5,
+                dl_vlan=l2_vlan,
+                dl_dst=state.local_router_mac,
+                dl_type=0x0800,
+                nw_dst=prefix,
+            )
+
+    def _install_l3vni_ingress(self, state, ofport):
+        """Ingress: L3VNI-tagged VXLAN -> load VRF ID into reg0, resubmit 50.
+
+        Priority 7 (above standard l2pop TUN_TO_LV entries at priority 1)
+        ensures L3VNI traffic is intercepted before the standard L2 decap
+        path.
+        """
+        vrf_id = self._get_vrf_id(state.vpn_instance_id)
+        self._bridge.add_flow(
+            table=ovs_const.TUN_TO_LV,
+            priority=FLOW_PRIORITY + 2,
+            cookie=COOKIE_T5,
+            in_port=ofport,
+            tun_id=state.l3vni,
+            actions="load:%d->NXM_NX_REG0[0..15],resubmit(,%d)" % (
+                vrf_id, XC_L3_ROUTE_TABLE),
+        )
+
+    def _install_local_subnet_route(self, state, local_prefix, local_l2_vlan):
+        """Re-bridge decapped L3VNI traffic into a local L2 subnet.
+
+        Match on reg0=<vrf_id> ensures VRF isolation in table 50.
+        After re-bridging, packet enters table 10 (LEARN) which delivers
+        to patch-int and then to br-int for final-hop delivery via the
+        neutron router's qr-xxx port.
+        """
+        vrf_id = self._get_vrf_id(state.vpn_instance_id)
+        self._bridge.add_flow(
+            table=XC_L3_ROUTE_TABLE,
+            priority=FLOW_PRIORITY,
+            cookie=COOKIE_T5,
+            reg0=vrf_id,
+            dl_type=0x0800,
+            nw_dst=local_prefix,
+            actions="mod_vlan_vid:%d,resubmit(,10)" % local_l2_vlan,
+        )
+
+    # --- Phase-2 reconcile helpers ----------------------------------------
+
+    def _resolve_local_router_mac(self, vpn_instance_id):
+        """Resolve local router MAC from bagpipe-bgp looking-glass.
+
+        Strategy: find the local Type-5 route (next_hop == xc_local_ip) in
+        this IPVPN instance and extract the rmac extended community.  This
+        is authoritative - it's exactly what remote peers receive.
+
+        Fallback: [BAGPIPE_XC] xc_local_router_mac config override.
+        """
+        try:
+            routes = self._lg.evi_routes_raw(vpn_instance_id)
+            for inner_key, attrs in routes.items():
+                # Find local route (next_hop == our xc_local_ip)
+                if not isinstance(attrs, dict):
+                    continue
+                next_hop = attrs.get("next_hop")
+                if not next_hop:
+                    next_hop = (attrs.get("attributes") or {}).get(
+                        "next_hop")
+                if next_hop != self._local_ip:
+                    continue
+                # Extract rmac from extended-community
+                ext_comm = (attrs.get("attributes") or {}).get(
+                    "extended-community", "")
+                m = _RE_RMAC.search(ext_comm)
+                if m:
+                    return m.group("mac").lower()
+        except Exception:
+            LOG.debug("xc-t5: looking-glass query failed for %s",
+                      vpn_instance_id, exc_info=True)
+
+        # Fallback: config override
+        configured = cfg.CONF.BAGPIPE_XC.xc_local_router_mac
+        if configured:
+            return configured.lower()
+
+        return None
+
+    def _resolve_local_subnets(self, vpn_instance_id):
+        """Resolve locally-attached subnet CIDRs for this L3VPN instance.
+
+        Queries looking-glass for local Type-5 routes (next_hop == self) -
+        these are the prefixes this node owns.  Used by _is_local_prefix()
+        guardrail.
+        """
+        local_subnets = set()
+        try:
+            routes = self._lg.evi_routes_raw(vpn_instance_id)
+            for inner_key, attrs in routes.items():
+                if not isinstance(attrs, dict):
+                    continue
+                next_hop = attrs.get("next_hop")
+                if not next_hop:
+                    next_hop = (attrs.get("attributes") or {}).get(
+                        "next_hop")
+                if next_hop != self._local_ip:
+                    continue
+                m = _RE_T5.match(inner_key)
+                if m:
+                    local_subnets.add(m.group("prefix"))
+        except Exception:
+            LOG.debug("xc-t5: failed resolving local subnets for %s",
+                      vpn_instance_id, exc_info=True)
+        return local_subnets
+
+    def _local_vlans_for_l3vpn(self):
+        """Resolve all local OVS VLANs from currently-tracked L2 EVIs.
+
+        On AIO-SX (single host), all L2 EVIs are local so their VLANs are
+        resolved.  On multi-compute, only locally-attached EVIs have a
+        resolved VLAN.  We collect all resolved VLANs - the set represents
+        all local subnets that can originate routed traffic.
+        """
+        vlans = set()
+        for evi_state in self.evis.values():
+            if evi_state.vlan is not None:
+                vlans.add(evi_state.vlan)
+        return vlans
+
+    def _reconcile_ipvpn_evi(self, state, want):
+        """Install/remove Type-5 flows for one IPVPN instance."""
+        state.l3vni = want.get("l3vni") or state.l3vni
+        state.local_router_mac = self._resolve_local_router_mac(
+            state.vpn_instance_id)
+        if not state.local_router_mac or not state.l3vni:
+            LOG.debug("xc-t5: %s not ready (rmac=%s l3vni=%s)",
+                      state.vpn_instance_id,
+                      state.local_router_mac, state.l3vni)
+            return
+
+        state.l2_vlans = self._local_vlans_for_l3vpn()
+        state.local_subnets = self._resolve_local_subnets(
+            state.vpn_instance_id)
+        state.vrf_id = self._get_vrf_id(state.vpn_instance_id)
+
+        new_prefixes = want["prefixes"]
+
+        # Install new prefix routes
+        for prefix in set(new_prefixes) - set(state.prefixes):
+            remote_pe, rmac = new_prefixes[prefix]
+            if not rmac:
+                LOG.warning("xc-t5: no rmac for prefix %s, skipping", prefix)
+                continue
+            ofport = self.tunnel_mgr.acquire(remote_pe)
+            if ofport is None:
+                continue
+            installed = self._install_prefix_route(
+                state, prefix, remote_pe, rmac, ofport)
+            if installed:
+                self._install_l3vni_ingress(state, ofport)
+                state.prefixes[prefix] = (remote_pe, rmac, ofport)
+            else:
+                self.tunnel_mgr.release(remote_pe)
+
+        # Install local subnet re-bridge rules in table 50
+        for local_cidr in state.local_subnets:
+            for l2_vlan in state.l2_vlans:
+                self._install_local_subnet_route(state, local_cidr, l2_vlan)
+
+        # Remove withdrawn prefix routes
+        for prefix in set(state.prefixes) - set(new_prefixes):
+            remote_pe, rmac, ofport = state.prefixes.pop(prefix)
+            self._remove_prefix_route(state, prefix)
+            self.tunnel_mgr.release(remote_pe)
+
+    def _tear_down_ipvpn_evi(self, state):
+        """Remove all Phase-2 flows for an evicted IPVPN instance."""
+        for prefix in list(state.prefixes):
+            remote_pe, rmac, ofport = state.prefixes.pop(prefix)
+            try:
+                self._remove_prefix_route(state, prefix)
+            except Exception:
+                LOG.exception("xc-t5: tear-down failed for prefix %s", prefix)
+            try:
+                self.tunnel_mgr.release(remote_pe)
+            except Exception:
+                pass
+        # Clean up table 4 (L3VNI ingress) and table 50 flows for this VRF
+        vrf_id = state.vrf_id
+        if vrf_id is not None:
+            self._bridge.delete_flows(
+                table=XC_L3_ROUTE_TABLE,
+                cookie=COOKIE_T5,
+                reg0=vrf_id,
+            )
+        # Remove L3VNI ingress flows (table 4) matching this L3VNI
+        if state.l3vni is not None:
+            self._bridge.delete_flows(
+                table=ovs_const.TUN_TO_LV,
+                cookie=COOKIE_T5,
+                tun_id=state.l3vni,
+            )
+        LOG.info("xc-t5: torn down ipvpn evi=%s (vrf_id=%s)",
+                 state.vpn_instance_id, vrf_id)
+
+    # --- Phase-2 RIB ingestion -------------------------------------------
+
+    def _build_wanted_ipvpn_from_rib(self):
+        """Read IPVPN instances from looking-glass and build wanted state.
+
+        Output::
+
+            {
+                "ipvpn_<router-uuid>": {
+                    "l3vni": 1000,
+                    "prefixes": {
+                        "10.98.0.0/24": ("172.16.85.54", "fa:16:3e:ab:cd:ef"),
+                    },
+                },
+                ...
+            }
+        """
+        wanted = {}
+        for evi_meta in self._lg.list_evis():
+            evi_id = evi_meta.get("id")
+            if not evi_id or not evi_id.startswith("ipvpn_"):
+                continue
+            entry = {"l3vni": None, "prefixes": {}}
+            for r in self._lg.evi_routes(evi_id):
+                if r.get("type") != 5:
+                    continue
+                remote_pe = r.get("remote_pe")
+                if not remote_pe or remote_pe == self._local_ip:
+                    continue
+                prefix = r.get("prefix")
+                l3vni = r.get("l3vni")
+                rmac = r.get("remote_router_mac")
+                if not all([prefix, l3vni]):
+                    continue
+                entry["l3vni"] = l3vni
+                entry["prefixes"][prefix] = (remote_pe, rmac)
+            wanted[evi_id] = entry
+        return wanted
