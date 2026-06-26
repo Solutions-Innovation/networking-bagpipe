@@ -870,6 +870,25 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
                         }
                     })
 
+        # Phase-2 XC: for IPVPN (L3VPN router association) pass the VNI
+        # so bagpipe-bgp uses it as instance_label (L3VNI) instead of
+        # allocating an MPLS label from the label pool.
+        # The BGPVPN L3 object's vni field must be set by the operator:
+        #   openstack bgpvpn create --type l3 --vni <l3vni> ...
+        if bbgp_vpn_type == bbgp_const.IPVPN:
+            l3_vnis = [
+                assoc.bgpvpn.vni
+                for assoc in assocs
+                if assoc.bgpvpn.vni is not None
+            ]
+            if l3_vnis:
+                if len(l3_vnis) > 1:
+                    LOG.warning("multiple L3VNIs for port %s, using %d",
+                                port_info.id, l3_vnis[0])
+                attach_info['vni'] = l3_vnis[0]
+                LOG.debug("xc-ipvpn: port %s using l3vni %s",
+                          port_info.id, l3_vnis[0])
+
         if bbgp_vpn_type == bbgp_const.EVPN:
             # if the network is a VXLAN network, then reuse same VNI
             # in bagpipe-bgp

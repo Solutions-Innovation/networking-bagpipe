@@ -201,18 +201,26 @@ _RE_PMSI = re.compile(
 
 # --- Phase-2: Type-5 IP Prefix route (inter-subnet routing) ---------------
 #
-# Type-5 inner-key format (bagpipe-bgp 22.0.0):
-#   evpn:prefix::<rd_pe>:<eth_tag>:<prefix>/<masklen>: label <label> (<l3vni>)
-# Example:
-#   evpn:prefix::172.16.85.54:0:10.98.0.0/24: label 1000 (1000)
+# exabgp 4.2.22 repr() format for EVPN Prefix NLRI (SHORT_NAME="PrfxAdv"):
+#   evpn:prfxadv::<rd_ip>:<rd_port>:<esi>:<etag>:<prefix>/<masklen>:<gwip>: label <raw> (<l3vni>)
+# Example (VNI=1000, VXLAN encoding raw=vni>>4):
+#   evpn:prfxadv::172.16.85.54:0:-:0:10.98.0.0/24:0.0.0.0: label 62 (1000)
+#
+# NOTE: The prefix token is "evpn:prfxadv::" NOT "evpn:prefix::".
+#       ESI field is "-" for zero ESI; gwip is "0.0.0.0".
+#       L3VNI is extracted from the parenthesized value after "label <raw>".
 _RE_T5 = re.compile(
-    r'^evpn:prefix::'
-    r'(?P<rd_pe>[^:]+):'
-    r'[^:]*:'                                        # eth_tag
-    r'(?P<prefix>[0-9./]+|[0-9A-Fa-f:./]+)'         # IP prefix/masklen
-    r':\s*label\s+\d+\s+\((?P<l3vni>\d+)\)'
+    r'^evpn:prfxadv::'          # SHORT_NAME="PrfxAdv" in exabgp prefix.py
+    r'(?P<rd_pe>[^:]+):'        # RD IP (e.g. "172.16.85.54")
+    r'[^:]*:'                   # RD port (e.g. "0")
+    r'[^:]*:'                   # ESI (typically "-" for empty)
+    r'[^:]*:'                   # etag (e.g. "0")
+    r'(?P<prefix>[0-9.]+/\d+)' # IP prefix/masklen (e.g. "10.98.0.0/24")
+    r':[^:]*'                   # gwip (e.g. "0.0.0.0")
+    r':\s*label\s+\d+\s+\((?P<l3vni>\d+)\)'  # label; l3vni in parens
     r'\s*$',
 )
+
 
 # Router MAC extended community (carried in Type-5 route attributes)
 _RE_RMAC = re.compile(r'rmac:(?P<mac>[0-9A-Fa-f:]{17})')
@@ -617,10 +625,12 @@ class _BagpipeLookingGlass:
                 "l3vni": int(m.group("l3vni")),
                 "remote_pe": next_hop or m.group("rd_pe"),
                 "remote_router_mac": rmac,
+                "route_family": "evpn_type5",
                 "mac": None,
                 "ip": None,
                 "vni": int(m.group("l3vni")),
             }
+
 
         return None
 
@@ -1333,19 +1343,42 @@ class EvpnXcHandler:
             evi_id = evi_meta.get("id")
             if not evi_id or not evi_id.startswith("ipvpn_"):
                 continue
-            entry = {"l3vni": None, "prefixes": {}}
+            entry = {"l3vni": cfg.CONF.BAGPIPE_XC.xc_l3vni, "prefixes": {}}
+            seen_type5 = 0
+            skipped_missing_l3vni = 0
+            skipped_missing_rmac = 0
             for r in self._lg.evi_routes(evi_id):
                 if r.get("type") != 5:
                     continue
+                if r.get("route_family") == "evpn_type5":
+                    seen_type5 += 1
                 remote_pe = r.get("remote_pe")
                 if not remote_pe or remote_pe == self._local_ip:
                     continue
                 prefix = r.get("prefix")
                 l3vni = r.get("l3vni")
                 rmac = r.get("remote_router_mac")
-                if not all([prefix, l3vni]):
+                if not prefix:
+                    continue
+                if not l3vni:
+                    skipped_missing_l3vni += 1
+                    continue
+                if not rmac:
+                    skipped_missing_rmac += 1
                     continue
                 entry["l3vni"] = l3vni
                 entry["prefixes"][prefix] = (remote_pe, rmac)
+
+            if not seen_type5:
+                LOG.debug(
+                    "xc-t5: %s has no EVPN Type-5 routes yet "
+                    "(prefixes=%d, missing_l3vni=%d, missing_rmac=%d)",
+                    evi_id, len(entry["prefixes"]),
+                    skipped_missing_l3vni, skipped_missing_rmac)
+            if skipped_missing_l3vni or skipped_missing_rmac:
+                LOG.debug(
+                    "xc-t5: %s skipped prefixes (missing_l3vni=%d, "
+                    "missing_rmac=%d)",
+                    evi_id, skipped_missing_l3vni, skipped_missing_rmac)
             wanted[evi_id] = entry
         return wanted

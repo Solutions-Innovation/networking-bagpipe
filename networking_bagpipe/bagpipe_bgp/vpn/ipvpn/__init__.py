@@ -26,6 +26,7 @@ from networking_bagpipe.bagpipe_bgp import engine
 from networking_bagpipe.bagpipe_bgp.engine import exa
 from networking_bagpipe.bagpipe_bgp.engine import flowspec
 from networking_bagpipe.bagpipe_bgp.engine import ipvpn as ipvpn_routes
+from networking_bagpipe.bagpipe_bgp.engine import exa as _exa_module
 from networking_bagpipe.bagpipe_bgp.vpn import dataplane_drivers as dp_drivers
 from networking_bagpipe.bagpipe_bgp.vpn import vpn_instance
 
@@ -68,8 +69,12 @@ class VRF(vpn_instance.VPNInstance, lg.LookingGlassMixin):
     # - cleanup: calling the driver, unregistering for BGP routes
 
     type = constants.IPVPN
-    afi = exa.AFI.ipv4
-    safi = exa.SAFI.mpls_vpn
+    # Phase-2 XC: force EVPN AFI (l2vpn/evpn) so routes are advertised as
+    # EVPN Type-5 IP Prefix (RFC 9136) instead of VPN-IPv4/MPLS.  The
+    # dataplane_driver = dummy config in [DATAPLANE_DRIVER_IPVPN] ensures no
+    # MPLS br-mpls interface is created.
+    afi = exa.AFI.l2vpn
+    safi = exa.SAFI.evpn
 
     @log_decorator.log
     def __init__(self, *args, **kwargs):
@@ -96,16 +101,65 @@ class VRF(vpn_instance.VPNInstance, lg.LookingGlassMixin):
 
     def _nlri_from(self, prefix, label, rd):
         assert rd is not None
-
-        return ipvpn_routes.IPVPNRouteFactory(
-            self.afi, prefix, label, rd,
-            self.dp_driver.get_local_address())
+        # Phase-2 XC: build EVPN Type-5 (IP Prefix) NLRI instead of VPN-IPv4.
+        # label here is self.instance_label (the L3VNI, passed as vni= in
+        # attach_info by the agent extension).
+        # gwip=0.0.0.0 is correct for symmetric IRB (RFC 9136 §5.1.3).
+        # nexthop must be set to the local VTEP IP so the EVPN peer knows
+        # how to reach us — exabgp uses this to populate the BGP NEXT_HOP.
+        ip_str, plen_str = prefix.split('/')
+        lbl = exa.Labels([], raw_labels=[label])   # VXLAN raw VNI encoding
+        return _exa_module.EVPNPrefix(
+            rd=rd,
+            esi=exa.ESI(),
+            etag=exa.EthernetTag(),
+            label=lbl,
+            ip=exa.IP.create(ip_str),
+            iplen=int(plen_str),
+            gwip=exa.IP.create('0.0.0.0'),
+            nexthop=exa.IP.create(self.dp_driver.get_local_address()),
+        )
 
     def generate_vif_bgp_route(self, mac_address, ip_prefix, plen, label, rd):
-        # Generate BGP route and advertise it...
+        # Phase-2 XC: generate EVPN Type-5 route entry.
+        # mac_address here is the router's qr-xxx port MAC (the rmac).
         nlri = self._nlri_from("{}/{}".format(ip_prefix, plen), label, rd)
-
         return engine.RouteEntry(nlri)
+
+    def synthesize_vif_bgp_route(self, mac_address, ip_prefix, plen, label,
+                                  lb_consistent_hash_order,
+                                  route_distinguisher=None,
+                                  local_pref=None):
+        """Override base class to use VXLAN encap and RouterMAC extended community.
+
+        The base class adds encap:Default+MPLS (from DummyDataplaneDriver.encaps).
+        We replace that with encap:VXLAN + rmac:<qr-mac> so EvpnXcHandler can
+        parse the looking-glass rmac: field.  The qr-xxx port MAC passed as
+        mac_address becomes the Router's MAC Extended Community (RFC 7432 §7.9).
+        """
+        rd = route_distinguisher if route_distinguisher else self.instance_rd
+        route_entry = self.generate_vif_bgp_route(
+            mac_address, ip_prefix, plen, label, rd)
+
+        # Extended communities: VXLAN encap + RouterMAC
+        ecommunities = exa.ExtendedCommunities()
+        ecommunities.add(exa.Encapsulation(exa.Encapsulation.Type.VXLAN))
+        if mac_address:
+            ecommunities.add(_exa_module.RouterMAC(mac_address))
+        route_entry.attributes.add(ecommunities)
+
+        # Route targets (merges with existing EC via set_route_targets)
+        route_entry.set_route_targets(self.export_rts)
+
+        # Consistent-hash sort order EC (required for ECMP)
+        ec_hash = exa.ExtendedCommunities()
+        ec_hash.communities.append(
+            exa.ConsistentHashSortOrder(lb_consistent_hash_order))
+        route_entry.attributes.add(ec_hash)
+
+        route_entry.attributes.add(
+            exa.LocalPreference(local_pref or 100))
+        return route_entry
 
     def _get_local_labels(self):
         for port_data in self.mac_2_localport_data.values():

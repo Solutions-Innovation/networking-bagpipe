@@ -72,9 +72,56 @@ from exabgp.bgp.message.update.nlri.evpn.nlri import EVPN
 from exabgp.bgp.message.update.nlri.evpn.mac import MAC as EVPNMAC
 from exabgp.bgp.message.update.nlri.evpn.multicast import \
     Multicast as EVPNMulticast
+from exabgp.bgp.message.update.nlri.evpn.prefix import \
+    Prefix as EVPNPrefix
 
 from exabgp.protocol.ip import IP
 from exabgp.protocol import Protocol
 
 from exabgp.reactor.protocol import AFI
 from exabgp.reactor.protocol import SAFI
+
+
+# ---------------------------------------------------------------- RouterMAC
+# RFC 7432 §7.9 — Router's MAC Extended Community
+# Type: 0x06  Sub-type: 0x03
+# Carried on EVPN Type-5 (IP Prefix) routes so remote VTEPs know which MAC
+# to use as eth_dst when forwarding routed traffic toward the advertising PE.
+#
+# exabgp 4.2.22 has no built-in RouterMAC class; raw bytes render as
+# "0x0603<hex>" which cannot be parsed by _RE_RMAC.  This class registers
+# the type/subtype so the community prints as "rmac:<mac>" for the handler.
+
+from exabgp.bgp.message.update.attribute.community.extended \
+    import ExtendedCommunity as _ExtendedCommunity
+
+
+@_ExtendedCommunity.register
+class RouterMAC(_ExtendedCommunity):
+    """EVPN Router's MAC extended community (type=0x06, subtype=0x03)."""
+
+    COMMUNITY_TYPE = 0x06
+    COMMUNITY_SUBTYPE = 0x03
+
+    __slots__ = ['_mac_str']
+
+    def __init__(self, mac_str, community=None):
+        """
+        mac_str: colon-separated MAC string, e.g. "fa:16:3e:11:22:33"
+        """
+        self._mac_str = mac_str.lower()
+        mac_bytes = bytes.fromhex(mac_str.replace(':', ''))
+        raw = bytes([0x06, 0x03]) + mac_bytes
+        _ExtendedCommunity.__init__(self, raw)
+
+    def __repr__(self):
+        return 'rmac:%s' % self._mac_str
+
+    def __str__(self):
+        return self.__repr__()
+
+    @staticmethod
+    def unpack(data):
+        mac_hex = data[2:8].hex()
+        mac_str = ':'.join(mac_hex[i:i+2] for i in range(0, 12, 2))
+        return RouterMAC(mac_str, data[:8])
