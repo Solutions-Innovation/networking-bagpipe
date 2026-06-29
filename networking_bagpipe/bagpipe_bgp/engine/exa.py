@@ -18,15 +18,29 @@
 # by other modules
 
 # flake8: noqa
-from exabgp.bgp.message.direction import Direction
-from exabgp.bgp.message.action import Action
+from exabgp.bgp.message.direction import Direction, OUT, IN
 
 # Note(lajoskatona): exabgp 5.0.0 changed how the IN/OUT enums look like.
-# Perhaps bagpipe can live with this backward compatibility trick
-OUT = Direction.OUT
-IN = Direction.IN
-OUT.ANNOUNCE = Action.ANNOUNCE
-OUT.WITHDRAW = Action.WITHDRAW
+# Perhaps bagpipe can live with this backward compatibility trick.
+# Under exabgp 4.2.x, OUT.ANNOUNCE is already defined as 1 (int), so we
+# must NOT overwrite it with a string or anything else.
+# Only apply the fallback if we don't have it, or if hasattr(OUT, 'ANNOUNCE') is False,
+# or we are running on exabgp 5.0.0 where Direction.OUT and Direction.IN need this.
+if not hasattr(OUT, 'ANNOUNCE'):
+    try:
+        # ExaBGP 4.2.x+
+        from exabgp.bgp.message.action import Action
+    except Exception:  # pragma: no cover - version compatibility
+        try:
+            # Older layouts used by some downstream WRCP images
+            from exabgp.bgp.message import Action
+        except Exception:
+            # Last-resort compatibility for very old ExaBGP trees
+            class Action(object):
+                ANNOUNCE = 'announce'
+                WITHDRAW = 'withdraw'
+    OUT.ANNOUNCE = Action.ANNOUNCE
+    OUT.WITHDRAW = Action.WITHDRAW
 
 from exabgp.bgp.message.open.asn import ASN
 
