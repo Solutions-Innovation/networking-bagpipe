@@ -189,6 +189,7 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
             try:
                 self.xc_handler = _evpn_xc_handler.EvpnXcHandler(
                     tun_br=self.tun_br,
+                    int_br=self.int_br,
                     vlan_manager=self.vlan_manager,
                     networks_info_getter=lambda: self.networks_info,
                 )

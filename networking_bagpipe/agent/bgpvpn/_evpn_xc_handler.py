@@ -259,6 +259,9 @@ _RE_T5 = re.compile(
 
 # Router MAC extended community (carried in Type-5 route attributes)
 _RE_RMAC = re.compile(r'rmac:(?P<mac>[0-9A-Fa-f:]{17})')
+# Extract L3VNI from the route-target in extended-community: target:ASN:VNI.
+# The VRF is per-tenant, so each route's RT encodes its own L3VNI.
+_RE_RT_VNI = re.compile(r'target:\d+:(?P<vni>\d+)')
 
 
 # Config group dedicated to this handler so it does not pollute upstream
@@ -777,22 +780,31 @@ class _BagpipeLookingGlass:
         m = _RE_T5.match(inner_key)
         if m:
             rmac = None
+            l3vni = None
             if isinstance(attrs, dict):
                 ext_comm = (attrs.get("attributes") or {}).get(
                     "extended-community", "")
                 rm = _RE_RMAC.search(ext_comm)
                 if rm:
                     rmac = rm.group("mac").lower()
+                # Extract L3VNI from the route-target (target:ASN:VNI).
+                # This is per-tenant — each route's RT encodes its own VNI.
+                rt_match = _RE_RT_VNI.search(ext_comm)
+                if rt_match:
+                    l3vni = int(rt_match.group("vni"))
+            # Fallback: NLRI label (exabgp internal counter, not the real VNI)
+            if l3vni is None:
+                l3vni = int(m.group("l3vni"))
             return {
                 "type": 5,
                 "prefix": m.group("prefix"),
-                "l3vni": int(m.group("l3vni")),
+                "l3vni": l3vni,
                 "remote_pe": next_hop or m.group("rd_pe"),
                 "remote_router_mac": rmac,
                 "route_family": "evpn_type5",
                 "mac": None,
                 "ip": None,
-                "vni": int(m.group("l3vni")),
+                "vni": l3vni,
             }
 
 
@@ -829,7 +841,7 @@ class EvpnXcHandler:
       multiple EVIs share one tunnel to the same remote PE.
     """
 
-    def __init__(self, tun_br, vlan_manager, networks_info_getter):
+    def __init__(self, tun_br, int_br, vlan_manager, networks_info_getter):
         if cfg.CONF.BAGPIPE_XC.xc_local_ip is None:
             raise ValueError(_(
                 "BAGPIPE_XC.xc_local_ip is not configured.  Set this to "
@@ -838,6 +850,7 @@ class EvpnXcHandler:
                 "OVS agent with the bagpipe_bgpvpn extension."))
 
         self._tun_br = tun_br
+        self._int_br = int_br
         self._bridge = dataplane_utils.OVSBridgeWithGroups(tun_br)
         self._vlan_manager = vlan_manager
         # Callable returning ``self.networks_info`` from the agent extension;
@@ -845,6 +858,13 @@ class EvpnXcHandler:
         self._networks_info = networks_info_getter
 
         self._local_ip = cfg.CONF.BAGPIPE_XC.xc_local_ip
+        # Resolve patch-tun ofport on br-int (the port connecting br-int → br-tun).
+        # Used by Phase-2 br-int intercept flows to redirect routed packets.
+        self._patch_tun_ofport = self._int_br.get_port_ofport('patch-tun')
+        if self._patch_tun_ofport is None or int(self._patch_tun_ofport) <= 0:
+            LOG.warning("xc: patch-tun ofport not found on br-int; "
+                        "Phase-2 br-int intercept flows will not be installed")
+            self._patch_tun_ofport = None
         self._lg = _BagpipeLookingGlass(
             host=cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_host,
             port=cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_port,
@@ -1317,15 +1337,21 @@ class EvpnXcHandler:
         path.
         """
         vrf_id = self._get_vrf_id(state.vpn_instance_id)
-        self._bridge.add_flow(
-            table=ovs_const.TUN_TO_LV,
-            priority=FLOW_PRIORITY + 2,
-            cookie=COOKIE_T5,
-            in_port=ofport,
-            tun_id=state.l3vni,
-            actions="load:%d->NXM_NX_REG0[0..15],resubmit(,%d)" % (
-                vrf_id, XC_L3_ROUTE_TABLE),
-        )
+        LOG.debug("xc-t5: installing L3VNI ingress: table=%s l3vni=%d vrf_id=%d ofport=%d",
+                  ovs_const.VXLAN_TUN_TO_LV, state.l3vni, vrf_id, ofport)
+        try:
+            self._bridge.add_flow(
+                table=ovs_const.VXLAN_TUN_TO_LV,
+                priority=FLOW_PRIORITY + 2,
+                cookie=COOKIE_T5,
+                in_port=ofport,
+                tun_id=state.l3vni,
+                actions="load:%d->NXM_NX_REG0[0..15],resubmit(,%d)" % (
+                    vrf_id, XC_L3_ROUTE_TABLE),
+            )
+            LOG.debug("xc-t5: L3VNI ingress installed OK")
+        except Exception as e:
+            LOG.warning("xc-t5: L3VNI ingress install FAILED: %s", e)
 
     def _install_local_subnet_route(self, state, local_prefix, local_l2_vlan):
         """Re-bridge decapped L3VNI traffic into a local L2 subnet.
@@ -1336,45 +1362,49 @@ class EvpnXcHandler:
         neutron router's qr-xxx port.
         """
         vrf_id = self._get_vrf_id(state.vpn_instance_id)
-        self._bridge.add_flow(
-            table=XC_L3_ROUTE_TABLE,
-            priority=FLOW_PRIORITY,
-            cookie=COOKIE_T5,
-            reg0=vrf_id,
-            dl_type=0x0800,
-            nw_dst=local_prefix,
-            actions="mod_vlan_vid:%d,resubmit(,10)" % local_l2_vlan,
-        )
+        LOG.debug("xc-t5: installing local subnet route: table=%d prefix=%s vlan=%d vrf_id=%d",
+                  XC_L3_ROUTE_TABLE, local_prefix, local_l2_vlan, vrf_id)
+        try:
+            self._bridge.add_flow(
+                table=XC_L3_ROUTE_TABLE,
+                priority=FLOW_PRIORITY,
+                cookie=COOKIE_T5,
+                reg0=vrf_id,
+                dl_type=0x0800,
+                nw_dst=local_prefix,
+                actions="mod_vlan_vid:%d,resubmit(,10)" % local_l2_vlan,
+            )
+            LOG.debug("xc-t5: local subnet route installed OK")
+        except Exception as e:
+            LOG.warning("xc-t5: local subnet route install FAILED: %s", e)
 
     # --- Phase-2 reconcile helpers ----------------------------------------
 
     def _resolve_local_router_mac(self, vpn_instance_id):
         """Resolve local router MAC from bagpipe-bgp looking-glass.
 
-        Strategy: find the local Type-5 route (next_hop == xc_local_ip) in
-        this IPVPN instance and extract the rmac extended community.  This
-        is authoritative - it's exactly what remote peers receive.
+        The correct MAC to use as dl_dst in the egress prefix route flow is
+        the **router's qr-port MAC** (the gateway interface on the L2
+        network), NOT the rmac from the Type-5 route's extended community
+        (which may be the VM's MAC if the fallback wasn't applied).
+
+        bagpipe-bgp's VRF instance exposes a ``fallback`` object in the
+        looking-glass with ``dst_mac`` = the router's qr-port MAC.  This
+        is the MAC that the qdhcp namespace / VM sends routed traffic to
+        (it ARPs the gateway IP and sends to the gateway MAC).
 
         Fallback: [BAGPIPE_XC] xc_local_router_mac config override.
         """
         try:
-            routes = self._lg.evi_routes_raw(vpn_instance_id)
-            for inner_key, attrs in routes.items():
-                # Find local route (next_hop == our xc_local_ip)
-                if not isinstance(attrs, dict):
-                    continue
-                next_hop = attrs.get("next_hop")
-                if not next_hop:
-                    next_hop = (attrs.get("attributes") or {}).get(
-                        "next_hop")
-                if next_hop != self._local_ip:
-                    continue
-                # Extract rmac from extended-community
-                ext_comm = (attrs.get("attributes") or {}).get(
-                    "extended-community", "")
-                m = _RE_RMAC.search(ext_comm)
-                if m:
-                    return m.group("mac").lower()
+            data = self._lg._get("vpns/instances/%s" % vpn_instance_id)
+            if data and isinstance(data, dict):
+                fallback = data.get("fallback")
+                if fallback and isinstance(fallback, dict):
+                    dst_mac = fallback.get("dst_mac")
+                    if dst_mac:
+                        LOG.debug("xc-t5: resolved local router MAC from VRF fallback: %s",
+                                  dst_mac)
+                        return dst_mac.lower()
         except Exception:
             LOG.debug("xc-t5: looking-glass query failed for %s",
                       vpn_instance_id, exc_info=True)
@@ -1389,25 +1419,32 @@ class EvpnXcHandler:
     def _resolve_local_subnets(self, vpn_instance_id):
         """Resolve locally-attached subnet CIDRs for this L3VPN instance.
 
-        Queries looking-glass for local Type-5 routes (next_hop == self) -
+        Queries looking-glass **adv_routes** (not best_routes, which only
+        has remote routes) for local Type-5 routes (next_hop == self) -
         these are the prefixes this node owns.  Used by _is_local_prefix()
-        guardrail.
+        guardrail and by the table-50 re-bridge flow install.
         """
         local_subnets = set()
         try:
-            routes = self._lg.evi_routes_raw(vpn_instance_id)
-            for inner_key, attrs in routes.items():
-                if not isinstance(attrs, dict):
+            data = self._lg._get(
+                "vpns/instances/%s/adv_routes" % vpn_instance_id)
+            if data is None:
+                return local_subnets
+            for entry in (data if isinstance(data, list) else []):
+                if not isinstance(entry, dict):
                     continue
-                next_hop = attrs.get("next_hop")
-                if not next_hop:
-                    next_hop = (attrs.get("attributes") or {}).get(
-                        "next_hop")
-                if next_hop != self._local_ip:
-                    continue
-                m = _RE_T5.match(inner_key)
-                if m:
-                    local_subnets.add(m.group("prefix"))
+                for inner_key, attrs in entry.items():
+                    if not isinstance(attrs, dict):
+                        continue
+                    next_hop = attrs.get("next_hop")
+                    if not next_hop:
+                        next_hop = (attrs.get("attributes") or {}).get(
+                            "next_hop")
+                    if next_hop != self._local_ip:
+                        continue
+                    m = _RE_T5.match(inner_key)
+                    if m:
+                        local_subnets.add(m.group("prefix"))
         except Exception:
             LOG.debug("xc-t5: failed resolving local subnets for %s",
                       vpn_instance_id, exc_info=True)
@@ -1442,6 +1479,15 @@ class EvpnXcHandler:
         state.local_subnets = self._resolve_local_subnets(
             state.vpn_instance_id)
         state.vrf_id = self._get_vrf_id(state.vpn_instance_id)
+        LOG.debug("xc-t5: %s state: rmac=%s l3vni=%s vlans=%s local_subnets=%s vrf_id=%s",
+                  state.vpn_instance_id, state.local_router_mac, state.l3vni,
+                  state.l2_vlans, state.local_subnets, state.vrf_id)
+
+        # PoC/upgrade debug: same as the L2 path — forget previously
+        # installed prefixes so the diff below re-installs all Type-5
+        # flows every cycle (self-healing against br-tun resets).
+        if cfg.CONF.BAGPIPE_XC.xc_debug_force_reinstall:
+            state.prefixes = {}
 
         new_prefixes = want["prefixes"]
 
@@ -1496,7 +1542,7 @@ class EvpnXcHandler:
         # Remove L3VNI ingress flows (table 4) matching this L3VNI
         if state.l3vni is not None:
             self._bridge.delete_flows(
-                table=ovs_const.TUN_TO_LV,
+                table=ovs_const.VXLAN_TUN_TO_LV,
                 cookie=COOKIE_T5,
                 tun_id=state.l3vni,
             )
@@ -1548,7 +1594,12 @@ class EvpnXcHandler:
                 if not rmac:
                     skipped_missing_rmac += 1
                     continue
-                entry["l3vni"] = l3vni
+                # Don't overwrite the configured xc_l3vni with the parsed
+                # value — the NLRI string's (N) is exabgp's internal label
+                # counter, NOT the actual VNI.  The configured xc_l3vni
+                # (set via [BAGPIPE_XC] xc_l3vni=1000) is authoritative.
+                if not entry.get("l3vni"):
+                    entry["l3vni"] = l3vni
                 entry["prefixes"][prefix] = (remote_pe, rmac)
 
             if not seen_type5:
