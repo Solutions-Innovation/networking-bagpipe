@@ -115,6 +115,7 @@ References
 import collections
 import configparser
 import ipaddress
+import logging as _stdlib_logging
 import os
 import re
 import threading
@@ -137,6 +138,38 @@ from neutron_lib.plugins.ml2 import ovs_constants as ovs_const
 
 
 LOG = logging.getLogger(__name__)
+# PoC diagnostics: WRCP's /etc/neutron/logging.conf routes only the `neutron`
+# and `neutron_taas` loggers to stdout; every other logger (incl.
+# networking_bagpipe.*) inherits [logger_root] which is bound to NullHandler --
+# so ALL networking_bagpipe.* log output is silently discarded regardless of
+# level.  For this PoC we attach our own StreamHandler straight to the
+# networking_bagpipe logger so xc: diagnostic lines reach the agent stdout/
+# log stream without depending on logging.conf being edited.  DEBUG level so
+# per-poll reconcile detail is visible; safe for PoC (not for production).
+import sys as _sys
+# PoC diagnostics: the agent runs with use_syslog=true, so neither oslo_log
+# output nor stdout is captured by `kubectl logs` for non-`neutron` loggers
+# (logging.conf binds networking_bagpipe to NullHandler).  Write xc: diagnostic
+# lines to /tmp/xc-diag.log inside the pod so they can be read with
+# `kubectl exec ... -- cat /tmp/xc-diag.log`.  DEBUG level; PoC-only.
+try:
+    _xc_fh = _stdlib_logging.FileHandler("/tmp/xc-diag.log", mode="a")
+    _xc_fh.setFormatter(_stdlib_logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s [xc-diag] %(message)s"))
+    _xc_logger = _stdlib_logging.getLogger("networking_bagpipe")
+    _xc_logger.addHandler(_xc_fh)
+    _xc_logger.setLevel(_stdlib_logging.DEBUG)
+    _xc_logger.propagate = False  # don't also hit root's NullHandler
+    LOG.setLevel(_stdlib_logging.DEBUG)
+    LOG.warning("xc: _evpn_xc_handler module imported (PoC /tmp/xc-diag.log handler attached)")
+except Exception as _exc:
+    # If /tmp isn't writable, fall back to stderr (may reach syslog).
+    _xc_logger = _stdlib_logging.getLogger("networking_bagpipe")
+    _xc_logger.addHandler(_stdlib_logging.StreamHandler(_sys.stderr))
+    _xc_logger.setLevel(_stdlib_logging.DEBUG)
+    _xc_logger.propagate = False
+    LOG.setLevel(_stdlib_logging.DEBUG)
+    LOG.warning("xc: _evpn_xc_handler module imported (PoC stderr fallback: %s)", _exc)
 
 
 # Cookie used on every flow this module installs.
@@ -276,6 +309,21 @@ xc_opts = [
                       "routing.  Normally auto-derived from the Type-5 "
                       "route's NLRI label field.  Set only if label "
                       "parsing produces incorrect values.")),
+    # PoC/upgrade debug flag -- NOT for production.  When true the handler
+    # (a) falls back to the last successfully resolved local VLAN if the
+    #     OVS agent's LocalVlanManager has dropped the mapping (which can
+    #     happen between port-plug events on a freshly-bounced agent), and
+    # (b) re-installs every flow on each poll cycle so any flows wiped by
+    #     an external br-tun reset are restored within one poll interval.
+    # Enable during the v3->v4 delta upgrade to keep the dataplane converged
+    # while the agent/vlan_manager settles; reset to false once stable.
+    cfg.BoolOpt('xc_debug_force_reinstall',
+                default=False,
+                help=_("PoC/upgrade debug: re-install all cross-cluster "
+                       "flows on every poll cycle and cache the local VLAN "
+                       "so it survives LocalVlanManager dropping the mapping. "
+                       "Not for production -- set true only during the v3->v4 "
+                       "upgrade, then false once the dataplane is stable.")),
 ]
 
 # Group name in cfg - kept under [BAGPIPE_XC] to leave [BAGPIPE] alone.
@@ -330,8 +378,8 @@ def _reload_bagpipe_xc_opts():
         return
     readable = [f for f in files if f and os.path.exists(f)]
     missing = [f for f in files if not (f and os.path.exists(f))]
-    LOG.info("xc: config-reload: discovered %d --config-file path(s): %s",
-             len(files), files)
+    LOG.warning("xc: config-reload: discovered %d --config-file path(s): %s",
+                len(files), files)
     if missing:
         LOG.warning("xc: config-reload: %d path(s) not readable, skipping "
                     "them: %s", len(missing), missing)
@@ -354,8 +402,8 @@ def _reload_bagpipe_xc_opts():
         if per_file.has_section(CONF_GROUP):
             source_file = f
             break
-    LOG.info("xc: config-reload: [%s] found in %s; applying overrides",
-             CONF_GROUP, source_file or readable[0])
+    LOG.warning("xc: config-reload: [%s] found in %s; applying overrides",
+                CONF_GROUP, source_file or readable[0])
     opt_by_name = {o.name: o for o in xc_opts}
     applied = 0
     skipped = []
@@ -367,7 +415,12 @@ def _reload_bagpipe_xc_opts():
             skipped.append("%s (not a registered XC opt)" % key)
             continue
         try:
-            coerced = int(val) if isinstance(opt, cfg.IntOpt) else val
+            if isinstance(opt, cfg.IntOpt):
+                coerced = int(val)
+            elif isinstance(opt, cfg.BoolOpt):
+                coerced = str(val).strip().lower() in ("true", "1", "yes", "on")
+            else:
+                coerced = val
             cfg.CONF.set_override(key, coerced, CONF_GROUP)
             LOG.debug("xc: config-reload: override %s=%r (%s)",
                       key, coerced, type(coerced).__name__)
@@ -381,12 +434,12 @@ def _reload_bagpipe_xc_opts():
             # overridden); keep the agent alive and log for diagnosis.
             skipped.append("%s=%r (%s: %s)" % (key, val, type(exc).__name__, exc))
     final_ip = cfg.CONF.BAGPIPE_XC.xc_local_ip
-    LOG.info("xc: config-reload: applied %d override(s), skipped %d; "
-             "xc_local_ip now=%r%s%s",
-             applied, len(skipped), final_ip,
-             "; skipped=" + ",".join(skipped) if skipped else "",
-             "" if final_ip is not None else
-             " (STILL None -> EvpnXcHandler will disable itself)")
+    LOG.warning("xc: config-reload: applied %d override(s), skipped %d; "
+                "xc_local_ip now=%r%s%s",
+                applied, len(skipped), final_ip,
+                "; skipped=" + ",".join(skipped) if skipped else "",
+                "" if final_ip is not None else
+                " (STILL None -> EvpnXcHandler will disable itself)")
 
 
 _reload_bagpipe_xc_opts()
@@ -806,12 +859,12 @@ class EvpnXcHandler:
         self._vrf_id_map = {}  # vpn_instance_id -> locally-significant vrf_id
 
         self._loop = None
-        LOG.info("xc: EvpnXcHandler initialized "
-                 "(local_pe=%s, lg=%s:%d, poll=%ds, cookie=0x%x/0x%x)",
-                 self._local_ip,
-                 cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_host,
-                 cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_port,
-                 cfg.CONF.BAGPIPE_XC.xc_poll_interval, COOKIE, COOKIE_T5)
+        LOG.warning("xc: EvpnXcHandler initialized "
+                    "(local_pe=%s, lg=%s:%d, poll=%ds, cookie=0x%x)",
+                    self._local_ip,
+                    cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_host,
+                    cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_port,
+                    cfg.CONF.BAGPIPE_XC.xc_poll_interval, COOKIE)
 
     @log_helpers.log_method_call
     def start(self):
@@ -964,6 +1017,15 @@ class EvpnXcHandler:
         try:
             mapping = self._vlan_manager.get(network_id, evi.vni)
         except Exception:
+            # PoC/upgrade debug: if the OVS agent's LocalVlanManager has
+            # dropped the mapping (common between port-plug events on a
+            # freshly-bounced agent) but we have resolved this EVI's VLAN
+            # before, reuse the cached value so flows stay installed.
+            if cfg.CONF.BAGPIPE_XC.xc_debug_force_reinstall and evi.vlan is not None:
+                LOG.debug("xc: no vlan mapping for net=%s vni=%s; using "
+                          "cached vlan=%s (xc_debug_force_reinstall=true)",
+                          network_id, evi.vni, evi.vlan)
+                return evi.vlan
             LOG.debug("xc: no vlan mapping for net=%s vni=%s",
                       network_id, evi.vni)
             return None
@@ -979,6 +1041,15 @@ class EvpnXcHandler:
             return
         evi.vlan = local_vlan
         evi.local_pe = self._local_ip
+
+        # PoC/upgrade debug: when xc_debug_force_reinstall is true, forget
+        # what we previously installed so the diff below treats every
+        # wanted MAC/PE as new and re-installs all flows this cycle.  This
+        # makes the handler self-healing against external br-tun resets
+        # (the OVS agent can wipe flows during its own (re)initialisation).
+        if cfg.CONF.BAGPIPE_XC.xc_debug_force_reinstall:
+            evi.unicast = {}
+            evi.flooding = {}
 
         # ---- Type-2 unicast diff ----
         new_unicast = want["unicast"]
