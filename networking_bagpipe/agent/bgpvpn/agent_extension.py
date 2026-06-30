@@ -36,9 +36,6 @@ from networking_bagpipe.agent.bgpvpn import constants as bgpvpn_const
 from networking_bagpipe.bagpipe_bgp import constants as bbgp_const
 from networking_bagpipe.objects import bgpvpn as objects
 
-from neutron.agent.common import ovs_lib
-from neutron.agent.linux.openvswitch_firewall import firewall \
-    as ovs_fw
 from neutron.api.rpc.callbacks.consumer import registry as rpc_registry
 from neutron.api.rpc.callbacks import events as rpc_events
 from neutron.api.rpc.handlers import resources_rpc
@@ -501,122 +498,23 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
         return False
 
     def _setup_ovs_bridge(self):
-        '''Setup the MPLS bridge for bagpipe-bgp.
+        '''Resolve br-tun<->br-int patch-port ofports.
 
-        Creates MPLS bridge, and links it to the integration and tunnel
-        bridges using patch ports.
-
-        :param mpls_br: the name of the MPLS bridge.
+        v4: the v3 MPLS bridge (br-mpls) and its patch ports are no longer
+        created.  Cross-cluster inter-subnet routing uses EVPN Type-5
+        (Symmetric IRB) programmed entirely on br-tun/br-int by
+        :class:`_evpn_xc_handler.EvpnXcHandler`; bagpipe-bgp's IPVPN VRF runs
+        with ``dataplane_driver=dummy`` and needs no OVS bridge or patch
+        port.  The previous code also called ``exit(1)`` when br-mpls was
+        absent, which crashed the agent on hosts without br-mpls.
         '''
-        mpls_br = cfg.CONF.BAGPIPE.mpls_bridge
-        self.mpls_br = ovs_lib.OVSBridge(mpls_br)
-
-        if not self.mpls_br.bridge_exists(mpls_br):
-            LOG.error("Unable to enable MPLS on this agent, MPLS bridge "
-                      "%(mpls_br)s doesn't exist. Agent terminated!",
-                      {"mpls_br": mpls_br})
-            exit(1)
-
-        # set secure mode
-        self.mpls_br.set_secure_mode()
-
-        # patch ports for traffic from tun bridge to mpls bridge
-        self.patch_tun_to_mpls_ofport = self.tun_br.add_patch_port(
-            cfg.CONF.BAGPIPE.tun_to_mpls_peer_patch_port,
-            cfg.CONF.BAGPIPE.mpls_to_tun_peer_patch_port)
-        self.patch_mpls_to_tun_ofport = self.mpls_br.add_patch_port(
-            cfg.CONF.BAGPIPE.mpls_to_tun_peer_patch_port,
-            cfg.CONF.BAGPIPE.tun_to_mpls_peer_patch_port)
-
-        # patch ports for traffic from mpls bridge to int bridge
-        self.patch_mpls_to_int_ofport = self.mpls_br.add_patch_port(
-            cfg.CONF.BAGPIPE.mpls_to_int_peer_patch_port,
-            cfg.CONF.BAGPIPE.int_to_mpls_peer_patch_port)
-        self.patch_int_to_mpls_ofport = self.int_br.add_patch_port(
-            cfg.CONF.BAGPIPE.int_to_mpls_peer_patch_port,
-            cfg.CONF.BAGPIPE.mpls_to_int_peer_patch_port)
-
-        if (int(self.patch_tun_to_mpls_ofport) < 0 or
-                int(self.patch_mpls_to_tun_ofport) < 0 or
-                int(self.patch_int_to_mpls_ofport) < 0 or
-                int(self.patch_mpls_to_int_ofport) < 0):
-            LOG.error("Failed to create OVS patch port. Cannot have "
-                      "MPLS enabled on this agent, since this version "
-                      "of OVS does not support patch ports. "
-                      "Agent terminated!")
-            exit(1)
-
         self.patch_tun2int = self.tun_br.get_port_ofport(
             cfg.CONF.OVS.tun_peer_patch_port)
-
-        # In br-tun, redirect all traffic from VMs towards the gateway
-        # into br-mplsexcept the traffic that already went through br-mpls
-        # and came back to br-tun via the fallback mecanism, this traffic is
-        # identified by the specific FALLBACK_SRC_MAC MAC address
-
-        # we need to copy the existing br-tun rules to dispatch to UCAST_TO_TUN
-        # and FLOOD_TO_TUN, but only for except_from_src_mac MAC,
-        # and with a priority of 2
-        self.tun_br.add_flow(table=ovs_agt_consts.PATCH_LV_TO_TUN,
-                             priority=2,
-                             dl_src=bgpvpn_const.FALLBACK_SRC_MAC,
-                             dl_dst="00:00:00:00:00:00/01:00:00:00:00:00",
-                             actions=("resubmit(,%s)" %
-                                      ovs_agt_consts.UCAST_TO_TUN))
-
-        self.tun_br.add_flow(table=ovs_agt_consts.PATCH_LV_TO_TUN,
-                             priority=2,
-                             dl_src=bgpvpn_const.FALLBACK_SRC_MAC,
-                             dl_dst="01:00:00:00:00:00/01:00:00:00:00:00",
-                             actions=("resubmit(,%s)" %
-                                      ovs_agt_consts.FLOOD_TO_TUN))
-
-        # Redirect traffic from the MPLS bridge to br-int
-        self.tun_br.add_flow(in_port=self.patch_tun_to_mpls_ofport,
-                             actions="output:%s" % self.patch_tun2int)
-
-        # In br-int...
-
         self.patch_int2tun = self.int_br.get_port_ofport(
             cfg.CONF.OVS.int_peer_patch_port)
 
-        # when the OVS firewall driver is used, we can handle the
-        # case where the gateway is directly connected to br-int:
-        # traffic that was already fallback'd is not touched
-
-        self.int_br.add_flow(
-            table=ovs_agt_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE,
-            priority=3,
-            dl_src=bgpvpn_const.FALLBACK_SRC_MAC,
-            actions="NORMAL",
-        )
-        # the base NORMAL action in this table is at priority 1
-        # the rules to redirect traffic are setup in gateway_traffic_redirect
-        # with a priority of 2
-
         # OVS1.3 needed for push_vlan in _gateway_traffic_redirect
         self.int_br.use_at_least_protocol(ovs_agt_consts.OPENFLOW13)
-
-    def _redirect_br_tun_to_mpls(self, dst_mac, vlan):
-        # then with a priority of 1, we redirect traffic to the dst_mac
-        # address to br-mpls
-        self.tun_br.add_flow(
-            table=ovs_agt_consts.PATCH_LV_TO_TUN,
-            priority=1,
-            in_port=self.patch_tun2int,
-            dl_dst=dst_mac,
-            dl_vlan=vlan,
-            actions="output:%s" % self.patch_tun_to_mpls_ofport
-        )
-
-    def _stop_redirect_br_tun_to_mpls(self, vlan):
-        self.tun_br.delete_flows(
-            strict=True,
-            table=ovs_agt_consts.PATCH_LV_TO_TUN,
-            priority=1,
-            in_port=self.patch_tun2int,
-            dl_vlan=vlan
-        )
 
     @log_helpers.log_method_call
     @lockutils.synchronized('bagpipe-bgpvpn')
@@ -692,45 +590,20 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
         LOG.debug("redirecting gw traffic for net %s: %s", net_info,
                   net_info.gateway_info)
 
-        # similar rules will later be added to redirect the traffic
-        # to each specific router MAC to br-mpls
+        # v4: inter-subnet routed traffic is steered to br-tun by the
+        # EvpnXcHandler br-int table-94 intercept flow (per remote prefix),
+        # not by the v3 gateway-MAC redirect to br-mpls.  Here we only manage
+        # the gateway ARP responder for the no-router (ARP-spoof) case.
 
         try:
             vlan = self.vlan_manager.get(net_info.id,
                                          net_info.segmentation_id).vlan
 
             if net_info.gateway_info.mac:
-                # there is a Neutron router on this network, so we won't
-                # ARP spoof the gateway IP...
+                # there is a Neutron router on this network, so the router
+                # answers ARP for the gateway IP itself; drop any responder
+                # entry a prior no-router setup may have left behind.
                 self._disable_gw_arp_responder(vlan, net_info.gateway_info.ip)
-                # but we will redirect traffic toward its MAC to br-mpls
-
-                self._redirect_br_tun_to_mpls(net_info.gateway_info.mac,
-                                              vlan)
-
-                # we keep this one just in case VMs have a stale ARP entry
-                # for the gateway IP:
-                self._redirect_br_tun_to_mpls(bgpvpn_const.DEFAULT_GATEWAY_MAC,
-                                              vlan)
-
-                # when the OVS firewall driver is used, we can handle the
-                # case where the gateway is directly connected to br-int:
-                # traffic to the gateway MAC will be sent directly to br-tun
-                # (ensuring that traffic that was already fallback'd is not
-                # touched is done in setup_mpls_br)
-
-                # (need push vlan because NORMAL will not be used, and hence
-                # won't the vlan tag)
-                flow = dict(
-                    table=ovs_agt_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE,
-                    priority=2,  # before NORMAL action
-                    reg_net=vlan,
-                    dl_dst=net_info.gateway_info.mac,
-                    actions="push_vlan:0x8100,mod_vlan_vid:%d,output:%s" % (
-                        vlan, self.patch_int2tun)
-                )
-                ovs_fw.create_reg_numbers(flow)
-                self.int_br.add_flow(**flow)
             else:
                 # no Neutron router plugged, so ARP spoofing the
                 # gateway IP is needed
@@ -739,9 +612,6 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
                                 net_info.id)
                     return
                 self._enable_gw_arp_responder(vlan, net_info.gateway_info.ip)
-
-                self._redirect_br_tun_to_mpls(bgpvpn_const.DEFAULT_GATEWAY_MAC,
-                                              vlan)
 
         except vlanmanager.MappingNotFound:
             LOG.warning("no VLAN mapping for net %s, no gateway redirection "
@@ -776,15 +646,6 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
             else:
                 LOG.debug('no gw IP for %s, no ARP responder to disable',
                           net_info.id)
-
-            self._stop_redirect_br_tun_to_mpls(vlan)
-
-            flow = dict(
-                table=ovs_agt_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE,
-                reg_net=vlan,
-            )
-            ovs_fw.create_reg_numbers(flow)
-            self.int_br.delete_flows(**flow)
         except vlanmanager.MappingNotFound:
             LOG.warning("no VLAN mapping for net %s, could not disable gw "
                         "redirection", net_info.id)
@@ -853,21 +714,18 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
                 attach_info['local_port']['vlan'] = vlan
 
             elif bbgp_vpn_type == bbgp_const.IPVPN:
-                attach_info['local_port'].update({
-                    'ovs': {
-                        'plugged': True,
-                        'port_number': self.patch_mpls_to_tun_ofport,
-                        'vlan': vlan
-                    }
-                })
-
-                # Add fallback information if needed as well
+                # v4: bagpipe-bgp's IPVPN VRF runs with dataplane_driver=dummy,
+                # so it does not consume an OVS port on br-mpls and we no
+                # longer pass local_port.ovs (no br-mpls patch port exists).
+                # The fallback dst_mac (the router qr-port MAC) is still
+                # required: the VRF advertises it as the EVPN Type-5 RouterMAC
+                # extended community (see ipvpn/__init__.py
+                # synthesize_vif_bgp_route).
                 if net_info.gateway_info.mac:
                     attach_info.update({
                         'fallback': {
                             'dst_mac': net_info.gateway_info.mac,
                             'src_mac': bgpvpn_const.FALLBACK_SRC_MAC,
-                            'ovs_port_number': self.patch_mpls_to_int_ofport
                         }
                     })
 

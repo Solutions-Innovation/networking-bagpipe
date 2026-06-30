@@ -21,7 +21,6 @@ import netaddr
 from oslo_utils import uuidutils
 
 from networking_bagpipe.agent.bgpvpn import agent_extension as bagpipe_agt_ext
-from networking_bagpipe.agent.bgpvpn import constants as bgpvpn_const
 from networking_bagpipe.bagpipe_bgp import constants as bbgp_const
 from networking_bagpipe.objects import bgpvpn as objects
 from networking_bagpipe.tests.unit.agent import base
@@ -1903,36 +1902,16 @@ class TestOVSAgentExtension(base.BaseTestOVSAgentExtension,
 
         # test what happened during initialize()
 
-        self.tun_br.add_patch_port.assert_called_once()
-        self.int_br.add_patch_port.assert_called_once()
-        self.agent_ext.mpls_br.set_secure_mode.assert_called_once()
-        self.assertEqual(self.agent_ext.mpls_br.add_patch_port.call_count,
-                         2)
+        # v4: _setup_ovs_bridge no longer creates br-mpls or any patch ports
+        # and installs no FALLBACK flows; it only resolves the br-tun<->br-int
+        # patch-port ofports and bumps the OpenFlow protocol.  The br-mpls
+        # bridge object (self.mpls_br) is no longer created at all.
+        self.tun_br.add_patch_port.assert_not_called()
+        self.int_br.add_patch_port.assert_not_called()
+        self.int_br.use_at_least_protocol.assert_called()
 
-        self.tun_br.add_flow.assert_has_calls(
-            [
-                mock.call(table=ovs_agt_constants.PATCH_LV_TO_TUN,
-                          priority=2,
-                          dl_src=bgpvpn_const.FALLBACK_SRC_MAC,
-                          dl_dst=mock.ANY,
-                          actions=mock.ANY),
-                mock.call(table=ovs_agt_constants.PATCH_LV_TO_TUN,
-                          priority=2,
-                          dl_src=bgpvpn_const.FALLBACK_SRC_MAC,
-                          dl_dst=mock.ANY,
-                          actions=mock.ANY),
-                mock.call(in_port=base.PATCH_TUN_TO_MPLS,
-                          actions="output:%d" % base.PATCH_TUN_TO_INT)
-            ],
-            any_order=True,
-        )
-
-        self.int_br.add_flow.assert_called_once_with(
-            table=ovs_agt_constants.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE,
-            priority=3,
-            dl_src="00:00:5e:2a:10:00",
-            actions="NORMAL",
-        )
+        self.tun_br.add_flow.assert_not_called()
+        self.int_br.add_flow.assert_not_called()
 
         self.int_br.add_flow.reset_mock()
         self.tun_br.add_flow.reset_mock()
@@ -1966,8 +1945,6 @@ class TestOVSAgentExtension(base.BaseTestOVSAgentExtension,
                             mac_address=base.PORT10['mac_address'],
                             gateway_ip=base.NETWORK1['gateway_ip'],
                             fallback={'dst_mac': GW_MAC,
-                                      'ovs_port_number':
-                                          base.PATCH_MPLS_TO_INT,
                                       'src_mac': '00:00:5e:2a:10:00'},
                             local_port=local_port['local_port'],
                             **self._expand_rts(base.BGPVPN_L3_RT100)
@@ -1999,25 +1976,16 @@ class TestOVSAgentExtension(base.BaseTestOVSAgentExtension,
 
             int_add_flow.assert_not_called()
 
-            tun_add_flow.assert_has_calls([
-                mock.call(
-                    table=ovs_agt_constants.ARP_RESPONDER,
-                    priority=2,
-                    dl_vlan=vlan,
-                    proto='arp',
-                    arp_op=0x01,
-                    arp_tpa=base.NETWORK1['gateway_ip'],
-                    actions=StringContains("5e004364"),
-                ),
-                mock.call(
-                    in_port=base.PATCH_TUN_TO_INT,
-                    dl_dst="00:00:5e:00:43:64",
-                    actions="output:%s" % base.PATCH_TUN_TO_MPLS,
-                    dl_vlan=vlan,
-                    priority=mock.ANY,
-                    table=mock.ANY
-                )],
-                any_order=True,
+            # v4 no-router case: only the gateway ARP responder is enabled;
+            # the v3 redirect of gateway-MAC traffic to br-mpls is gone.
+            tun_add_flow.assert_called_once_with(
+                table=ovs_agt_constants.ARP_RESPONDER,
+                priority=2,
+                dl_vlan=vlan,
+                proto='arp',
+                arp_op=0x01,
+                arp_tpa=base.NETWORK1['gateway_ip'],
+                actions=StringContains("5e004364"),
             )
 
             int_add_flow.reset_mock()
@@ -2048,33 +2016,12 @@ class TestOVSAgentExtension(base.BaseTestOVSAgentExtension,
                 arp_op=0x01,
                 arp_tpa=base.NETWORK1['gateway_ip'])
 
-            # check that traffic to gw is sent to br-mpls
-            tun_add_flow.assert_has_calls(
-                [
-                    mock.call(in_port=base.PATCH_TUN_TO_INT,
-                              dl_dst=GW_MAC,
-                              actions="output:%s" % base.PATCH_TUN_TO_MPLS,
-                              dl_vlan=vlan,
-                              priority=mock.ANY,
-                              table=mock.ANY),
-                    mock.call(in_port=base.PATCH_TUN_TO_INT,
-                              dl_dst="00:00:5e:00:43:64",
-                              actions="output:%s" % base.PATCH_TUN_TO_MPLS,
-                              dl_vlan=vlan,
-                              priority=mock.ANY,
-                              table=mock.ANY)
-                ],
-                any_order=True
-            )
-
-            int_add_flow.assert_called_once_with(
-                table=ovs_agt_constants.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE,
-                priority=2,
-                reg6=vlan,
-                dl_dst=GW_MAC,
-                actions="push_vlan:0x8100,mod_vlan_vid:%d,output:%s" % (
-                        vlan, base.PATCH_INT_TO_TUN)
-            )
+            # we now have a router with a real GW MAC: v4 only disables the
+            # gateway ARP responder (the router answers ARP itself); there is
+            # no br-mpls redirect and no br-int ACCEPTED_EGRESS flow, so
+            # neither tun_br.add_flow nor int_br.add_flow is called.
+            tun_add_flow.assert_not_called()
+            int_add_flow.assert_not_called()
 
             int_add_flow.reset_mock()
             tun_add_flow.reset_mock()
@@ -2084,30 +2031,19 @@ class TestOVSAgentExtension(base.BaseTestOVSAgentExtension,
             # stop the redirection when association is cleared
             self._net_assoc_notif(net_assoc, rpc_events.DELETED)
 
-            # ARP responder deletion
-            tun_delete_flows.assert_has_calls(
-                [
-                    mock.call(
-                        strict=True,
-                        table=ovs_agt_constants.PATCH_LV_TO_TUN,
-                        priority=1,
-                        in_port=base.PATCH_TUN_TO_INT,
-                        dl_vlan=vlan
-                    ),
-                    mock.call(
-                        strict=True,
-                        table=ovs_agt_constants.ARP_RESPONDER,
-                        priority=2,
-                        dl_vlan=vlan,
-                        proto='arp',
-                        arp_op=0x01,
-                        arp_tpa=base.NETWORK1['gateway_ip'],)
-                ],
-                any_order=True
-            )
-            int_delete_flows.assert_called_once_with(
-                table=ovs_agt_constants.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE,
-                reg6=vlan)
+            # v4: clearing the L3 association only disables the gateway ARP
+            # responder; the v3 br-mpls redirect teardown and the br-int
+            # ACCEPTED_EGRESS flow deletion are gone.
+            tun_delete_flows.assert_called_once_with(
+                strict=True,
+                table=ovs_agt_constants.ARP_RESPONDER,
+                priority=2,
+                dl_vlan=vlan,
+                proto='arp',
+                arp_op=0x01,
+                arp_tpa=base.NETWORK1['gateway_ip'])
+
+            int_delete_flows.assert_not_called()
 
     def test_gateway_redirection_ovs_restart(self):
         GW_MAC = 'aa:bb:cc:dd:ee:ff'
@@ -2125,13 +2061,19 @@ class TestOVSAgentExtension(base.BaseTestOVSAgentExtension,
                                              **base.BGPVPN_L3_RT100)
             self._net_assoc_notif(net_assoc, rpc_events.UPDATED)
 
-            add_flow.assert_called()
-
-            add_flow.reset_mock()
+            # v4: with a real router (GW_MAC), _gateway_traffic_redirect only
+            # disables the gateway ARP responder -- no br-mpls redirect, no
+            # br-int ACCEPTED_EGRESS flow -- so int_br.add_flow is not called.
+            add_flow.assert_not_called()
 
             with mock.patch.object(self.agent_ext, '_setup_ovs_bridge') as \
-                    mock_setup_mpls_br:
+                    mock_setup_ovs_bridge, \
+                mock.patch.object(self.agent_ext,
+                                  '_gateway_traffic_redirect') as \
+                    mock_gw_redirect:
                 self.agent_ext.ovs_restarted(None, None, None)
-                mock_setup_mpls_br.assert_called()
+                mock_setup_ovs_bridge.assert_called_once()
+                # ovs_restarted must re-apply gateway redirect for L3 nets
+                mock_gw_redirect.assert_called()
 
-            add_flow.assert_called()
+            add_flow.assert_not_called()

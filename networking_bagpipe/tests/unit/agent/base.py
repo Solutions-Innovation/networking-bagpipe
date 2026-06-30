@@ -314,16 +314,13 @@ class BaseTestOVSAgentExtension(ovs_test_base.OVSOSKenTestBase,
                                  segmentation_id, port_id, detach=False):
         vlan = self.vlan_manager.get(network_id, segmentation_id).vlan
         if bbgp_vpn_type == bbgp_const.IPVPN:
+            # v4: the IPVPN VRF runs with dataplane_driver=dummy, so the agent
+            # no longer passes local_port.ovs (no br-mpls patch port).
             r = dict(
                 local_port=dict(
                     linuxif='{}:{}'.format(bgpvpn_const.LINUXIF_PREFIX, vlan),
-                    ovs=dict(plugged=True,
-                             port_number=PATCH_MPLS_TO_TUN,
-                             vlan=vlan)
                 )
             )
-            if detach:
-                del r['local_port']['ovs']
             return r
         else:
             r = dict(
