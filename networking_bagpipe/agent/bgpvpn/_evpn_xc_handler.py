@@ -113,7 +113,9 @@ References
 """
 
 import collections
+import configparser
 import ipaddress
+import os
 import re
 import threading
 
@@ -279,6 +281,115 @@ xc_opts = [
 # Group name in cfg - kept under [BAGPIPE_XC] to leave [BAGPIPE] alone.
 CONF_GROUP = 'BAGPIPE_XC'
 cfg.CONF.register_opts(xc_opts, CONF_GROUP)
+
+
+def _reload_bagpipe_xc_opts():
+    """Re-read [BAGPIPE_XC] from the agent's --config-file list at import time.
+
+    The neutron-openvswitch-agent parses its config files at process startup,
+    BEFORE the bagpipe_bgpvpn extension module is imported.  Because this
+    module registers the [BAGPIPE_XC] opts at import time (just above),
+    oslo-config has already silently discarded the [BAGPIPE_XC] section by
+    the time the opts are registered -- so cfg.CONF.BAGPIPE_XC.* read their
+    defaults (e.g. xc_local_ip=None) instead of the operator-set values,
+    and EvpnXcHandler.__init__ raises ValueError, disabling the poll-based
+    reconciler that re-installs cross-cluster flows after an agent bounce.
+
+    This re-reads [BAGPIPE_XC] from the same --config-file paths the agent
+    used (discovered from /proc/self/cmdline) and set_override()s each value
+    so the reconciler can actually start.  Safe no-op if /proc/self/cmdline
+    is unavailable (e.g. unit-test import) or [BAGPIPE_XC] is absent.
+
+    Every branch logs so a future misconfiguration can be pinpointed from the
+    agent log alone (no in-pod python needed):
+      - which --config-file paths were discovered from /proc/self/cmdline
+      - which of those were readable vs missing
+      - whether [BAGPIPE_XC] was found, and in which file
+      - each opt overridden (name, coerced value, type) or skipped (reason)
+      - the final resolved xc_local_ip that EvpnXcHandler.__init__ will see
+    """
+    try:
+        with open('/proc/self/cmdline', 'rb') as f:
+            argv = [a.decode() for a in f.read().split(b'\x00') if a]
+    except Exception as exc:
+        # /proc/self/cmdline unavailable (e.g. unit-test import, non-Linux).
+        # Not fatal: opts keep their defaults; handler will disable itself
+        # with the usual 'BAGPIPE_XC.xc_local_ip is not configured' message.
+        LOG.info("xc: config-reload: cannot read /proc/self/cmdline (%s); "
+                 "[BAGPIPE_XC] will use oslo-registered defaults", exc)
+        return
+    files = []
+    for i, a in enumerate(argv):
+        if a == '--config-file' and i + 1 < len(argv):
+            files.append(argv[i + 1])
+        elif a.startswith('--config-file='):
+            files.append(a.split('=', 1)[1])
+    if not files:
+        LOG.debug("xc: config-reload: no --config-file in /proc/self/cmdline "
+                  "(argv=%s); skipping re-read", argv[:1])
+        return
+    readable = [f for f in files if f and os.path.exists(f)]
+    missing = [f for f in files if not (f and os.path.exists(f))]
+    LOG.info("xc: config-reload: discovered %d --config-file path(s): %s",
+             len(files), files)
+    if missing:
+        LOG.warning("xc: config-reload: %d path(s) not readable, skipping "
+                    "them: %s", len(missing), missing)
+    # interpolation=None: [DEFAULT] keys like log_format='[%(name)s] %(message)s'
+    # would otherwise raise InterpolationMissingOptionError during cp.items().
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read(readable)
+    if not cp.has_section(CONF_GROUP):
+        LOG.warning("xc: config-reload: no [%s] section in any of %s; "
+                    "EvpnXcHandler will disable itself (xc_local_ip stays "
+                    "None). Operator fix: add [%s] xc_local_ip=<underlay-ip> "
+                    "to the agent's ml2_conf.ini.",
+                    CONF_GROUP, readable, CONF_GROUP)
+        return
+    # Find which file actually contributed the section (for log attribution).
+    source_file = None
+    for f in readable:
+        per_file = configparser.ConfigParser(interpolation=None)
+        per_file.read(f)
+        if per_file.has_section(CONF_GROUP):
+            source_file = f
+            break
+    LOG.info("xc: config-reload: [%s] found in %s; applying overrides",
+             CONF_GROUP, source_file or readable[0])
+    opt_by_name = {o.name: o for o in xc_opts}
+    applied = 0
+    skipped = []
+    for key, val in cp.items(CONF_GROUP):
+        opt = opt_by_name.get(key)
+        if opt is None:
+            # Unknown key in [BAGPIPE_XC] (typo, or a future opt not in this
+            # build). Not fatal; record so a typo is visible in the log.
+            skipped.append("%s (not a registered XC opt)" % key)
+            continue
+        try:
+            coerced = int(val) if isinstance(opt, cfg.IntOpt) else val
+            cfg.CONF.set_override(key, coerced, CONF_GROUP)
+            LOG.debug("xc: config-reload: override %s=%r (%s)",
+                      key, coerced, type(coerced).__name__)
+            applied += 1
+        except ValueError:
+            skipped.append("%s=%r (invalid %s)" % (key, val, type(opt).__name__))
+        except KeyError as exc:
+            skipped.append("%s=%r (KeyError: %s)" % (key, val, exc))
+        except Exception as exc:
+            # set_override can raise oslo-internal errors (e.g. already
+            # overridden); keep the agent alive and log for diagnosis.
+            skipped.append("%s=%r (%s: %s)" % (key, val, type(exc).__name__, exc))
+    final_ip = cfg.CONF.BAGPIPE_XC.xc_local_ip
+    LOG.info("xc: config-reload: applied %d override(s), skipped %d; "
+             "xc_local_ip now=%r%s%s",
+             applied, len(skipped), final_ip,
+             "; skipped=" + ",".join(skipped) if skipped else "",
+             "" if final_ip is not None else
+             " (STILL None -> EvpnXcHandler will disable itself)")
+
+
+_reload_bagpipe_xc_opts()
 
 
 class EviState:
