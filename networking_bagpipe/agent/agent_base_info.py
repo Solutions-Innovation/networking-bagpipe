@@ -134,9 +134,20 @@ class NetworkInfo(CommonInfo):
         self.gateway_info = NO_GW_INFO
         self.ports = set()
         self.segmentation_id = None
+        # Set of locally-attached subnet CIDRs for this network, e.g.
+        # {"10.99.0.0/24"}.  Populated from the BGPVPN association's subnet
+        # RPC dict (subnet['cidr']).  Used by the Phase-2 Type-5 handler's
+        # subnet-range guardrail (_is_local_prefix) so a remote /32 host route
+        # that belongs to a subnet we also host locally is reached over native
+        # neutron VXLAN (L2 / Type-2) instead of the L3VNI cross-cluster tunnel.
+        self.subnet_cidrs = set()
 
     def set_gateway_info(self, gateway_info):
         self.gateway_info = gateway_info
+
+    def add_subnet_cidr(self, cidr):
+        if cidr:
+            self.subnet_cidrs.add(cidr)
 
     def __repr__(self):
         return "NetInfo: {} (segmentation id:{}, gw:{}), ".format(

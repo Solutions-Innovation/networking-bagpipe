@@ -312,6 +312,20 @@ xc_opts = [
                       "routing.  Normally auto-derived from the Type-5 "
                       "route's NLRI label field.  Set only if label "
                       "parsing produces incorrect values.")),
+    cfg.ListOpt('xc_local_subnet_cidrs',
+                default=[],
+                help=_("Optional explicit list of locally-hosted subnet "
+                       "CIDRs (e.g. 10.99.0.0/24,10.98.0.0/24) used by the "
+                       "Phase-2 Type-5 subnet-range guardrail.  Normally the "
+                       "handler derives these from the neutron BGPVPN "
+                       "association (NetworkInfo.subnet_cidrs).  Because "
+                       "bagpipe-bgp advertises per-VM /32 host routes "
+                       "(advertise_subnet=False), the handler cannot infer "
+                       "the subnet mask from a route alone -- a remote /32 in "
+                       "a subnet that also exists locally must be reached over "
+                       "native neutron VXLAN (L2), not the L3VNI tunnel.  Set "
+                       "this only as a fallback if the neutron-derived CIDRs "
+                       "are unavailable.")),
     # PoC/upgrade debug flag -- NOT for production.  When true the handler
     # (a) falls back to the last successfully resolved local VLAN if the
     #     OVS agent's LocalVlanManager has dropped the mapping (which can
@@ -422,6 +436,9 @@ def _reload_bagpipe_xc_opts():
                 coerced = int(val)
             elif isinstance(opt, cfg.BoolOpt):
                 coerced = str(val).strip().lower() in ("true", "1", "yes", "on")
+            elif isinstance(opt, cfg.ListOpt):
+                coerced = [item.strip() for item in val.split(",")
+                           if item.strip()]
             else:
                 coerced = val
             cfg.CONF.set_override(key, coerced, CONF_GROUP)
@@ -509,14 +526,24 @@ class IpvpnEviState:
       ofport)``.  Tracks installed Type-5-derived egress flows.
     * ``l2_vlans`` - set of local OVS VLANs that belong to this L3VPN's
       subnets (used for installing per-VLAN egress flows).
-    * ``local_subnets`` - set of locally-attached subnet CIDRs.  Used by
-      ``_is_local_prefix()`` guardrail.
+    * ``local_subnets`` - set of this node's own /32 host routes (resolved
+      from the looking-glass ``adv_routes``).  These are the local prefixes
+      this node owns; used to drive the table-50 re-bridge install.  NOTE:
+      these are /32s, NOT subnet ranges -- see ``local_subnet_cidrs``.
+    * ``local_subnet_cidrs`` - set of locally-hosted *subnet ranges* (e.g.
+      ``{"10.99.0.0/24"}``), derived from the neutron BGPVPN association
+      (``NetworkInfo.subnet_cidrs``) or the ``xc_local_subnet_cidrs`` config
+      fallback.  Used by the ``_is_local_prefix()`` guardrail: a remote /32
+      that falls inside one of these ranges belongs to a subnet we host
+      locally and must be reached over native neutron VXLAN (L2 / Type-2),
+      NOT the L3VNI cross-cluster tunnel.
     * ``vrf_id`` - locally-significant integer loaded into reg0 for table 50
       VRF isolation.
     """
 
     __slots__ = ("vpn_instance_id", "l3vni", "local_router_mac",
-                 "prefixes", "l2_vlans", "local_subnets", "vrf_id")
+                 "prefixes", "l2_vlans", "local_subnets",
+                 "local_subnet_cidrs", "vrf_id")
 
     def __init__(self, vpn_instance_id):
         self.vpn_instance_id = vpn_instance_id
@@ -526,16 +553,20 @@ class IpvpnEviState:
         self.prefixes = {}
         # set of local OVS VLANs that belong to this L3VPN
         self.l2_vlans = set()
-        # set of locally-attached subnet CIDRs (e.g. {"10.99.0.0/24"})
+        # set of this node's own /32 host routes (e.g. {"10.99.0.11/32"})
         self.local_subnets = set()
+        # set of locally-hosted subnet RANGES (e.g. {"10.99.0.0/24"}) -- the
+        # authoritative guardrail input (see _is_local_prefix)
+        self.local_subnet_cidrs = set()
         # Locally-significant VRF ID (loaded into reg0 for table 50 isolation)
         self.vrf_id = None
 
     def __repr__(self):
         return ("IpvpnEviState(id=%s, l3vni=%s, vrf_id=%s, n_prefixes=%d, "
-                "local_subnets=%s)" %
+                "local_subnets=%s, local_subnet_cidrs=%s)" %
                 (self.vpn_instance_id, self.l3vni, self.vrf_id,
-                 len(self.prefixes), self.local_subnets))
+                 len(self.prefixes), self.local_subnets,
+                 self.local_subnet_cidrs))
 
 
 class PerPeVxlanPortMgr:
@@ -1371,15 +1402,53 @@ class EvpnXcHandler:
         return True
 
     def _is_local_prefix(self, prefix, state):
-        """Return True if prefix overlaps any locally-attached subnet.
+        """Return True if ``prefix`` belongs to a locally-hosted subnet RANGE.
 
-        Prevents installing Type-5 egress flows for locally attached
-        prefixes that are already reachable via the L2 Type-2 path.
+        Root-cause fix (v4 backlog): bagpipe-bgp advertises per-VM **/32 host
+        routes** by default (``advertise_subnet=False``; see
+        ``vpn_instance._check_ip_mac`` which forces ``plen=32``).  The old
+        guardrail compared the received /32 against ``state.local_subnets`` --
+        which is itself only this node's own **/32** host routes -- so a /32
+        could only ever match the *identical* local IP, never the subnet.
+
+        Because the cross-cluster design REQUIRES the same subnet CIDR to exist
+        on both clusters (unified underlay, matching ``--subnet-range``), a
+        remote VM that lives on a subnet we also host locally (e.g. remote
+        ``10.99.0.50/32`` while we host ``10.99.0.0/24``) slipped past the
+        guardrail and got a Type-5 egress flow.  That wrongly pushed
+        intra-subnet (L2-reachable) traffic onto the L3VNI VTEP tunnel to the
+        remote cluster instead of keeping it on the local VRF / native neutron
+        VXLAN (Type-2) path.
+
+        The correct test is against the locally-hosted **subnet ranges**
+        (``state.local_subnet_cidrs``, e.g. ``10.99.0.0/24``), derived from
+        neutron (``NetworkInfo.subnet_cidrs``) or the ``xc_local_subnet_cidrs``
+        config fallback.  A remote /32 that is a subnet-of (or overlaps) any
+        locally-hosted range is L2-reachable and must NOT be routed via L3VNI.
+
+        We also keep the legacy /32 overlap test against ``local_subnets`` as a
+        belt-and-suspenders guard for the exact-IP case.
         """
         target = ipaddress.ip_network(prefix, strict=False)
+        # Primary: locally-hosted subnet ranges (the real fix).
+        for local_cidr in state.local_subnet_cidrs:
+            try:
+                local_net = ipaddress.ip_network(local_cidr, strict=False)
+            except ValueError:
+                continue
+            if target.version != local_net.version:
+                continue
+            # A /32 inside a /24 (or any overlap, incl. equal subnet) is local.
+            if target.subnet_of(local_net) or target.overlaps(local_net):
+                return True
+        # Secondary (legacy): exact local /32 host routes.
         for local_cidr in state.local_subnets:
-            local_net = ipaddress.ip_network(local_cidr, strict=False)
-            if target.overlaps(local_net):
+            try:
+                local_net = ipaddress.ip_network(local_cidr, strict=False)
+            except ValueError:
+                continue
+            if target.version == local_net.version and \
+                    target.overlaps(local_net):
                 return True
         return False
 
@@ -1536,6 +1605,53 @@ class EvpnXcHandler:
                       vpn_instance_id, exc_info=True)
         return local_subnets
 
+    def _resolve_local_subnet_cidrs(self, state):
+        """Resolve the locally-hosted subnet RANGES for this L3VPN instance.
+
+        Unlike :meth:`_resolve_local_subnets` (which returns this node's own
+        /32 host routes from the looking-glass), this returns true subnet
+        ranges such as ``10.99.0.0/24`` so the :meth:`_is_local_prefix`
+        guardrail can recognise any remote /32 that belongs to a subnet we
+        host locally and must therefore be reached over native neutron VXLAN
+        (L2 / Type-2), NOT the L3VNI cross-cluster tunnel.
+
+        Sources, unioned:
+
+        1. Neutron BGPVPN association: ``NetworkInfo.subnet_cidrs`` for every
+           L2 network whose local VLAN is in ``state.l2_vlans`` (this VRF).
+           This is the authoritative, automatic source.
+        2. ``[BAGPIPE_XC] xc_local_subnet_cidrs`` config fallback, for
+           environments where the neutron-derived CIDRs are unavailable.
+        """
+        cidrs = set()
+        # 1. From neutron networks_info (authoritative).
+        try:
+            networks_info = self._networks_info() or {}
+            for evi_id, evi_state in self.evis.items():
+                if not evi_id.startswith("evpn_"):
+                    continue
+                if evi_state.vlan is None or evi_state.vlan not in state.l2_vlans:
+                    continue
+                net_id = evi_id[len("evpn_"):]
+                net_info = networks_info.get(net_id)
+                if not net_info:
+                    continue
+                for cidr in getattr(net_info, "subnet_cidrs", set()) or set():
+                    cidrs.add(cidr)
+        except Exception:
+            LOG.debug("xc-t5: failed resolving local subnet CIDRs from "
+                      "networks_info for %s", state.vpn_instance_id,
+                      exc_info=True)
+        # 2. Config fallback (union).
+        try:
+            for cidr in (cfg.CONF.BAGPIPE_XC.xc_local_subnet_cidrs or []):
+                cidr = cidr.strip()
+                if cidr:
+                    cidrs.add(cidr)
+        except Exception:
+            pass
+        return cidrs
+
     def _local_vlans_for_l3vpn(self):
         """Resolve all local OVS VLANs from currently-tracked L2 EVIs.
 
@@ -1599,10 +1715,13 @@ class EvpnXcHandler:
         state.l2_vlans = self._local_vlans_for_l3vpn()
         state.local_subnets = self._resolve_local_subnets(
             state.vpn_instance_id)
+        state.local_subnet_cidrs = self._resolve_local_subnet_cidrs(state)
         state.vrf_id = self._get_vrf_id(state.vpn_instance_id)
-        LOG.debug("xc-t5: %s state: rmac=%s l3vni=%s vlans=%s local_subnets=%s vrf_id=%s",
+        LOG.debug("xc-t5: %s state: rmac=%s l3vni=%s vlans=%s "
+                  "local_subnets=%s local_subnet_cidrs=%s vrf_id=%s",
                   state.vpn_instance_id, state.local_router_mac, state.l3vni,
-                  state.l2_vlans, state.local_subnets, state.vrf_id)
+                  state.l2_vlans, state.local_subnets,
+                  state.local_subnet_cidrs, state.vrf_id)
 
         # PoC/upgrade debug: same as the L2 path — forget previously
         # installed prefixes so the diff below re-installs all Type-5

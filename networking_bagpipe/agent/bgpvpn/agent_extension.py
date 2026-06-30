@@ -353,6 +353,12 @@ class BagpipeBgpvpnAgentExtension(l2_extension.L2AgentExtension,
                 subnet['gateway_mac'],
                 subnet['gateway_ip']
             )
+            # Record the subnet CIDR (range) so the Phase-2 Type-5 handler can
+            # tell whether a remote /32 host route belongs to a subnet we host
+            # locally.  bagpipe-bgp advertises per-VM /32 host routes (default
+            # advertise_subnet=False), so the cross-cluster handler cannot infer
+            # the subnet mask from the route alone; it must come from neutron.
+            net_info.add_subnet_cidr(subnet.get('cidr'))
             if subnet['ip_version'] == 4:
                 net_info.set_gateway_info(gateway_info)
                 if assoc.bgpvpn.type == bgpvpn.BGPVPN_L3:
