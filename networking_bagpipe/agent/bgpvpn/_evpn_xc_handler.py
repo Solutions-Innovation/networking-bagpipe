@@ -852,6 +852,24 @@ class EvpnXcHandler:
         self._tun_br = tun_br
         self._int_br = int_br
         self._bridge = dataplane_utils.OVSBridgeWithGroups(tun_br)
+        # OVSBridgeWithGroups.__init__ bumps br-tun to OpenFlow11 (needed for
+        # groups), but OpenFlow11 rejects two things this handler installs:
+        #   (a) push_vlan in the br-int table-94 intercept flow (egress
+        #       packets are untagged at table 94, so the intercept must push
+        #       the 802.1Q VLAN before output:patch-tun or the br-tun table-20
+        #       Type-5 egress flow's dl_vlan match never hits), and
+        #   (b) resubmit(,XC_L3_ROUTE_TABLE) and table=XC_L3_ROUTE_TABLE
+        #       matches in br-tun (the L3VNI ingress table 4 and the re-bridge
+        #       table 50), which need OXM or NXM+table_id — OpenFlow11 allows
+        #       neither, so ovs-ofctl fails with "none of the usable flow
+        #       formats (OXM,NXM+table_id) is among the allowed flow formats
+        #       (OpenFlow11)" and the flows silently never land in OVS.
+        # Bump both bridges to OpenFlow13 (OXM) so run_ofctl emits
+        # `-O OpenFlow13`, which supports push_vlan and table-resubmit.
+        # use_at_least_protocol only ever raises the version (max), so this
+        # is safe for the agent's own flows already installed at OpenFlow10.
+        self._bridge.use_at_least_protocol(ovs_const.OPENFLOW13)
+        self._int_br.use_at_least_protocol(ovs_const.OPENFLOW13)
         self._vlan_manager = vlan_manager
         # Callable returning ``self.networks_info`` from the agent extension;
         # we use it to look up vni / network_id mappings on-demand.
@@ -1321,6 +1339,14 @@ class EvpnXcHandler:
             #    This flow matches at priority 6 (above L2 delivery at priority 2)
             #    and sends the packet to br-tun via patch-tun, where the br-tun
             #    Type-5 flow above tunnels it via L3VNI.
+            #
+            #    push_vlan is required: in the OVS firewall pipeline egress
+            #    packets reach table 94 UNTAGGED (the network VLAN is carried in
+            #    reg6, not in the 802.1Q tag).  Because this flow bypasses the
+            #    NORMAL action (which would tag the packet on egress to the trunk
+            #    patch port), we must push the VLAN ourselves — otherwise the
+            #    packet arrives at br-tun with no dl_vlan and the br-tun table-20
+            #    Type-5 egress flow (which matches dl_vlan=<l2_vlan>) never hits.
             patch_tun = self._get_patch_tun_ofport()
             if patch_tun is not None:
                 try:
@@ -1332,7 +1358,8 @@ class EvpnXcHandler:
                         dl_dst=state.local_router_mac,
                         dl_type=0x0800,
                         nw_dst=prefix,
-                        actions="output:%d" % patch_tun,
+                        actions="push_vlan:0x8100,mod_vlan_vid:%d,output:%d" % (
+                            l2_vlan, patch_tun),
                     )
                 except Exception as e:
                     LOG.warning("xc-t5: br-int intercept install failed for "
@@ -1523,6 +1550,41 @@ class EvpnXcHandler:
                 vlans.add(evi_state.vlan)
         return vlans
 
+    def _prefix_to_vlan(self, prefix):
+        """Map a local subnet prefix to the L2 VLAN of the network owning it.
+
+        The IPVPN VRF advertises /32 (or /128) host routes per local VM, but
+        the table-50 re-bridge flow must tag the decapped packet with the VLAN
+        of the L2 network that **owns** the destination subnet.  Re-bridging
+        to the wrong VLAN strands the packet on a network where no host has
+        that IP (e.g. a 10.99.0.11 reply tagged with the 8888 VLAN never
+        reaches the 9999-network VM).
+
+        The prefix is a host route (e.g. 10.99.0.11/32); we extract the host
+        IP and find the L2 EVI whose network has a plugged port with that IP
+        (via the agent's networks_info).  This is robust against the gateway
+        IP being absent from NetworkInfo (which happens when the network's
+        gateway_info has not been populated for the IPVPN association).
+        Returns the VLAN int, or None if no owning network is found.
+        """
+        try:
+            net = ipaddress.ip_network(prefix, strict=False)
+        except ValueError:
+            return None
+        host_ip = str(net.network_address)
+        networks_info = self._networks_info() or {}
+        for evi_id, evi_state in self.evis.items():
+            if not evi_id.startswith("evpn_") or evi_state.vlan is None:
+                continue
+            net_id = evi_id[len("evpn_"):]
+            net_info = networks_info.get(net_id)
+            if not net_info:
+                continue
+            for port_info in net_info.ports:
+                if port_info.ip_address == host_ip:
+                    return evi_state.vlan
+        return None
+
     def _reconcile_ipvpn_evi(self, state, want):
         """Install/remove Type-5 flows for one IPVPN instance."""
         state.l3vni = want.get("l3vni") or state.l3vni
@@ -1567,10 +1629,19 @@ class EvpnXcHandler:
             else:
                 self.tunnel_mgr.release(remote_pe)
 
-        # Install local subnet re-bridge rules in table 50
+        # Install local subnet re-bridge rules in table 50.  Each local
+        # prefix is re-bridged to the VLAN of the L2 network that OWNS its
+        # subnet (resolved via _prefix_to_vlan) -- NOT to every L2 VLAN,
+        # which would install competing same-priority flows and strand
+        # packets on the wrong network.
         for local_cidr in state.local_subnets:
-            for l2_vlan in state.l2_vlans:
-                self._install_local_subnet_route(state, local_cidr, l2_vlan)
+            vlan = self._prefix_to_vlan(local_cidr)
+            if vlan is None:
+                LOG.warning("xc-t5: no L2 VLAN found owning local subnet %s "
+                            "-- skipping table-50 re-bridge install",
+                            local_cidr)
+                continue
+            self._install_local_subnet_route(state, local_cidr, vlan)
 
         # Remove withdrawn prefix routes
         for prefix in set(state.prefixes) - set(new_prefixes):
