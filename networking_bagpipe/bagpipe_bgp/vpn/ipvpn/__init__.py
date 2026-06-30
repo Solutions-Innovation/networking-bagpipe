@@ -142,10 +142,21 @@ class VRF(vpn_instance.VPNInstance, lg.LookingGlassMixin):
             mac_address, ip_prefix, plen, label, rd)
 
         # Extended communities: VXLAN encap + RouterMAC
+        # Per the v4 design (doc §2.2), the RouterMAC EC must be the
+        # **router's qr-port MAC** (the gateway interface), NOT the VM's
+        # MAC.  The fallback.dst_mac from the attach_info carries the
+        # router's qr-port MAC; mac_address is the VM's MAC.
         ecommunities = exa.ExtendedCommunities()
         ecommunities.add(exa.Encapsulation(exa.Encapsulation.Type.VXLAN))
-        if mac_address:
-            ecommunities.add(_exa_module.RouterMAC(mac_address))
+        rmac_to_use = mac_address
+        if self.fallback and isinstance(self.fallback, dict):
+            fallback_dst = self.fallback.get('dst_mac')
+            if fallback_dst:
+                rmac_to_use = fallback_dst
+                self.log.debug("Using fallback dst_mac %s as RouterMAC (not VM mac %s)",
+                               rmac_to_use, mac_address)
+        if rmac_to_use:
+            ecommunities.add(_exa_module.RouterMAC(rmac_to_use))
         route_entry.attributes.add(ecommunities)
 
         # Route targets (merges with existing EC via set_route_targets)
@@ -438,6 +449,9 @@ class VRF(vpn_instance.VPNInstance, lg.LookingGlassMixin):
     def route_to_tracked_entry(self, route):
         if isinstance(route.nlri, ipvpn_routes.IPVPN):
             return route.nlri.cidr.prefix()
+        elif isinstance(route.nlri, _exa_module.EVPNPrefix):
+            # EVPN Type-5 (IP Prefix) NLRI — keyed by the advertised prefix.
+            return "%s/%d" % (route.nlri.ip, route.nlri.iplen)
         elif isinstance(route.nlri, flowspec.Flow):
             return (flowspec.Flow, route.nlri._rules())
         else:
@@ -547,7 +561,7 @@ class VRF(vpn_instance.VPNInstance, lg.LookingGlassMixin):
             # best routes, then we don't want to clear the dataplane entry
             if self.equivalent_route_in_best_routes(
                     old_route,
-                    lambda r: (r.nexthop, r.nlri.labels.labels[0])):
+                    lambda r: (r.nexthop, self._nlri_label(r.nlri))):
                 self.log.debug("Route for same dataplane is still in best "
                                "routes, skipping removal")
                 return
@@ -556,7 +570,10 @@ class VRF(vpn_instance.VPNInstance, lg.LookingGlassMixin):
             if not encaps:
                 return
 
-            assert len(old_route.nlri.labels.labels) == 1
+            old_label = self._nlri_label(old_route.nlri)
+            if old_label is None:
+                self.log.warning("No label/VNI in old route %s, skipping", old_route)
+                return
 
             lb_consistent_hash_order = 0
             if old_route.ecoms(exa.ConsistentHashSortOrder):
@@ -565,7 +582,7 @@ class VRF(vpn_instance.VPNInstance, lg.LookingGlassMixin):
 
             self.dataplane.remove_dataplane_for_remote_endpoint(
                 prefix, old_route.nexthop,
-                old_route.nlri.labels.labels[0], old_route.nlri, encaps,
+                old_label, old_route.nlri, encaps,
                 lb_consistent_hash_order)
 
     # Looking glass ###

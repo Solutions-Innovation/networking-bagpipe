@@ -858,13 +858,9 @@ class EvpnXcHandler:
         self._networks_info = networks_info_getter
 
         self._local_ip = cfg.CONF.BAGPIPE_XC.xc_local_ip
-        # Resolve patch-tun ofport on br-int (the port connecting br-int → br-tun).
-        # Used by Phase-2 br-int intercept flows to redirect routed packets.
-        self._patch_tun_ofport = self._int_br.get_port_ofport('patch-tun')
-        if self._patch_tun_ofport is None or int(self._patch_tun_ofport) <= 0:
-            LOG.warning("xc: patch-tun ofport not found on br-int; "
-                        "Phase-2 br-int intercept flows will not be installed")
-            self._patch_tun_ofport = None
+        # patch-tun ofport on br-int is resolved lazily (not at init time)
+        # because the OVS agent creates patch ports AFTER extension init.
+        self._patch_tun_ofport = None
         self._lg = _BagpipeLookingGlass(
             host=cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_host,
             port=cfg.CONF.BAGPIPE_XC.xc_bagpipe_api_port,
@@ -1255,6 +1251,26 @@ class EvpnXcHandler:
 
     # --- Phase-2 OpenFlow primitives --------------------------------------
 
+    def _get_patch_tun_ofport(self):
+        """Lazily resolve the patch-tun ofport on br-int.
+
+        The OVS agent creates patch ports AFTER extension init, so this
+        can't be resolved in __init__.  Cached after first successful resolve.
+        """
+        if self._patch_tun_ofport is not None:
+            return self._patch_tun_ofport
+        if self._int_br is None:
+            return None
+        try:
+            ofport = self._int_br.get_port_ofport('patch-tun')
+            if ofport is not None and int(ofport) > 0:
+                self._patch_tun_ofport = int(ofport)
+                LOG.debug("xc-t5: resolved patch-tun ofport=%d", self._patch_tun_ofport)
+                return self._patch_tun_ofport
+        except Exception:
+            pass
+        return None
+
     def _install_prefix_route(self, state, prefix, remote_pe,
                               remote_router_mac, ofport):
         """Egress: routed IP prefix -> dec_ttl + MAC swap + L3VNI encap.
@@ -1286,6 +1302,7 @@ class EvpnXcHandler:
             ofport=ofport,
         )
         for l2_vlan in state.l2_vlans:
+            # 1. br-tun: Type-5 egress flow (tunnel encap to remote PE)
             self._bridge.add_flow(
                 table=ovs_const.UCAST_TO_TUN,
                 priority=FLOW_PRIORITY + 1,
@@ -1296,6 +1313,30 @@ class EvpnXcHandler:
                 nw_dst=prefix,
                 actions=actions,
             )
+            # 2. br-int: intercept flow — redirect routed traffic to br-tun
+            #    BEFORE it reaches the router's qr-port.  Without this, br-int
+            #    table 94 delivers the packet to the qr-port (local delivery at
+            #    priority 2), and the router's kernel drops it with "Destination
+            #    Host Unreachable" because it has no route to the remote subnet.
+            #    This flow matches at priority 6 (above L2 delivery at priority 2)
+            #    and sends the packet to br-tun via patch-tun, where the br-tun
+            #    Type-5 flow above tunnels it via L3VNI.
+            patch_tun = self._get_patch_tun_ofport()
+            if patch_tun is not None:
+                try:
+                    self._int_br.add_flow(
+                        table=94,
+                        priority=FLOW_PRIORITY + 1,
+                        cookie=COOKIE_T5,
+                        reg6=l2_vlan,
+                        dl_dst=state.local_router_mac,
+                        dl_type=0x0800,
+                        nw_dst=prefix,
+                        actions="output:%d" % patch_tun,
+                    )
+                except Exception as e:
+                    LOG.warning("xc-t5: br-int intercept install failed for "
+                                "prefix %s vlan=%d: %s", prefix, l2_vlan, e)
         LOG.debug("xc-t5: installed prefix route %s -> remote_pe=%s "
                   "rmac=%s l3vni=%d ofport=%d (vlans=%s)",
                   prefix, remote_pe, remote_router_mac,
@@ -1318,6 +1359,7 @@ class EvpnXcHandler:
     def _remove_prefix_route(self, state, prefix):
         """Remove egress prefix route flows for all local L2 VLANs."""
         for l2_vlan in state.l2_vlans:
+            # 1. br-tun: remove Type-5 egress flow
             self._bridge.delete_flows(
                 strict=True,
                 table=ovs_const.UCAST_TO_TUN,
@@ -1328,6 +1370,23 @@ class EvpnXcHandler:
                 dl_type=0x0800,
                 nw_dst=prefix,
             )
+            # 2. br-int: remove intercept flow
+            patch_tun = self._get_patch_tun_ofport()
+            if patch_tun is not None:
+                try:
+                    self._int_br.delete_flows(
+                        strict=True,
+                        table=94,
+                        priority=FLOW_PRIORITY + 1,
+                        cookie=COOKIE_T5,
+                        reg6=l2_vlan,
+                        dl_dst=state.local_router_mac,
+                        dl_type=0x0800,
+                        nw_dst=prefix,
+                    )
+                except Exception as e:
+                    LOG.debug("xc-t5: br-int intercept remove failed for "
+                               "prefix %s vlan=%d: %s", prefix, l2_vlan, e)
 
     def _install_l3vni_ingress(self, state, ofport):
         """Ingress: L3VNI-tagged VXLAN -> load VRF ID into reg0, resubmit 50.
