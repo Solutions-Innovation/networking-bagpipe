@@ -1335,6 +1335,22 @@ class EvpnXcHandler:
         if self._is_local_prefix(prefix, state):
             LOG.debug("xc-t5: skipping locally-attached prefix %s for evi=%s",
                       prefix, state.vpn_instance_id)
+            # Startup-race cleanup (see Appendix A.9): a previous reconcile
+            # cycle may have installed Type-5 egress + br-int intercept flows
+            # for this prefix while state.local_subnet_cidrs was still being
+            # populated by the L2 handler.  If neutron-ovs-agent's own
+            # br-tun table-20 reconcile later wipes the Type-5 half but not
+            # the br-int intercept (which lives in a table it doesn't own),
+            # UC5-style traffic (routed cross-VNI) hits the stale intercept,
+            # gets pushed to br-tun with the wrong dl_vlan, misses the
+            # (now absent) Type-5 flow, and floods as an L2VNI packet to
+            # the peer PE which silently drops it.  Best-effort strict
+            # remove: if nothing was installed, delete_flows is a no-op.
+            try:
+                self._remove_prefix_route(state, prefix)
+            except Exception:
+                LOG.debug("xc-t5: guardrail cleanup for prefix %s failed "
+                          "(best-effort)", prefix, exc_info=True)
             return False
 
         actions = (
